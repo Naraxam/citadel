@@ -134,11 +134,16 @@ bool cardMatchesFilter(const Card& c, std::string_view filter,
             }
             // no game pointer: accept any library card conservatively
         }
-        // ChosenType: card's type line includes the type stored in game->chosenTypeName.
+        // ChosenType: card's type line includes the chosen type. Prefer the
+        // ability source's per-card choice (Herald's Horn et al.), falling back
+        // to the global chosenTypeName for spells that set it transiently.
         else if (q == "ChosenType") {
-            if (!game || game->chosenTypeName.empty()) { /* conservative */ }
+            std::string ctStore = (sourceCard && !sourceCard->chosenType.empty())
+                                  ? sourceCard->chosenType
+                                  : (game ? game->chosenTypeName : std::string());
+            if (ctStore.empty()) { /* conservative: no choice yet — accept */ }
             else {
-                const std::string& ct = game->chosenTypeName;
+                const std::string& ct = ctStore;
                 bool typeMatch = false;
                 if      (ct == "Creature")     typeMatch = c.isCreature();
                 else if (ct == "Land")         typeMatch = c.isLand();

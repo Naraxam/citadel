@@ -1369,6 +1369,16 @@ void effectToken(const ScriptLine& s, EffectContext& ctx) {
                 if (k == "shroud")        return "Shroud";
                 return "";   // not a keyword (it's a subtype)
             };
+            // Trailing functional suffixes on Forge token scripts encode an
+            // ability variant, NOT a creature subtype (e.g. eldrazi_spawn_SAC,
+            // zombie_DECAYED, devil_BURN). Treating them as subtypes corrupts the
+            // token's name — "Eldrazi Spawn" became "Eldrazi Spawn Sac" — which
+            // breaks the Scryfall token-art lookup (keyed on the exact name).
+            auto isAbilityHint = [](const std::string& t) {
+                return t == "sac"     || t == "decayed" || t == "tappump" ||
+                       t == "lifegain"|| t == "noblock" || t == "burn"    ||
+                       t == "search"  || t == "draw"    || t == "tapped";
+            };
 
             if (!parts.empty()) {
                 using namespace ManaAtom;
@@ -1402,6 +1412,11 @@ void effectToken(const ScriptLine& s, EffectContext& ctx) {
                                 k + 1 < parts.size() && parts[k + 1] == "strike")
                                 ++k;
                             keywords.push_back(disp);
+                        } else if (isAbilityHint(parts[k])) {
+                            // Functional suffix, not a subtype — drop it from the
+                            // name/types so art lookup matches. (createToken injects
+                            // the matching ability by token name, e.g. Eldrazi Spawn.)
+                            continue;
                         } else {
                             subs.push_back(cap(parts[k]));
                         }
@@ -1955,9 +1970,13 @@ void effectScry(const ScriptLine& s, EffectContext& ctx) {
         bool useful = (isLand && needLand) || (!isLand && castSoon);
         if (useful) keep.push_back(c); else bottom.push_back(c);
     }
-    // Put kept cards back on top in original order, bottom cards go under
-    for (Card* c : keep)
+    // Put kept cards back on top in original order, bottom cards go under.
+    // Kept-on-top cards are now known to their owner (shown face-up in the
+    // library browser until drawn or shuffled away).
+    for (Card* c : keep) {
+        c->revealedToOwner = true;
         p.library().addToFront(c);
+    }
     for (Card* c : bottom)
         p.library().addToBack(c);
 }
@@ -2397,7 +2416,7 @@ void effectSurveil(const ScriptLine& s, EffectContext& ctx) {
         bool isLand    = c->rules->type.isLand();
         bool castSoon  = c->rules->cmc() <= myLands + 2;
         bool keep = (isLand && needLand) || (!isLand && castSoon);
-        if (keep) p.library().addToFront(c);
+        if (keep) { c->revealedToOwner = true; p.library().addToFront(c); }
         else      ctx.game.moveToZone(c->id, ZoneType::Graveyard, ctx.controller);
     }
 }
@@ -2834,17 +2853,20 @@ void effectPeekAndReveal(const ScriptLine& s, EffectContext& ctx) {
     if (noPeek) return; // nothing to look at
 
     // Collect top peekNum cards from the library
-    std::vector<const Card*> peeked;
+    std::vector<Card*> peeked;
     auto& lib = ctx.game.player(pid).library();
     int idx = 0;
-    for (const Card* c : lib.cards()) {
+    for (Card* c : lib.cards()) {
         if (idx++ >= peekNum) break;
         peeked.push_back(c);
     }
 
     ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
 
-    for (const Card* c : peeked) {
+    for (Card* c : peeked) {
+        // Looking at the top of the library makes those cards known to the
+        // viewer until they're drawn/moved or the library is shuffled.
+        c->revealedToOwner = true;
         bool matchesReveal = revealValid.empty()
             || cardMatchesAnyFilter(*c, revealValid, pid, selfId, ctx.source, &ctx.game);
         if (remPeeked)

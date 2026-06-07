@@ -338,6 +338,13 @@ std::optional<CardRules> CardScriptParser::parseLines(const std::vector<std::str
                 bool optional = ecSep != std::string_view::npos &&
                                 ecRest.substr(ecSep + 1) == "Optional";
                 rules.etbCopy = CardRules::ETBCopyEntry{ std::move(svarName), optional };
+            } else if (value.size() > 21 && value.substr(0, 21) == "ETBReplacement:Other:") {
+                // K:ETBReplacement:Other:SVar[:Optional] — run the named SVar's
+                // effect as the permanent enters (e.g. ChooseCT → choose a type).
+                auto eoRest = value.substr(21);
+                auto eoSep  = eoRest.find(':');
+                rules.etbOtherSVar = std::string(eoSep == std::string_view::npos
+                                                 ? eoRest : eoRest.substr(0, eoSep));
             } else if (value.size() > 8 && value.substr(0, 8) == "Cycling:") {
                 rules.cyclingCost = ManaCost::parse(value.substr(8));
                 rules.hasCycling  = true;

@@ -281,12 +281,12 @@ GameWindow::GameWindow(const std::filesystem::path& cardFolder,
         title.setStyle(sf::Text::Bold);
         title.setFillColor(sf::Color(230, 193, 112));
         title.setPosition(WIN_W * 0.5f - title.getLocalBounds().width * 0.5f, 180.f);
-        m_window.draw(title);
+        drawText(title);
 
         sf::Text sub("Loading", m_font, 16);
         sub.setFillColor(sf::Color(148, 139, 124));
         sub.setPosition(WIN_W * 0.5f - sub.getLocalBounds().width * 0.5f, 230.f);
-        m_window.draw(sub);
+        drawText(sub);
 
         // Stage label
         std::string label = (st < kStageCount) ? kStageLabels[st] : "Finishing up";
@@ -295,14 +295,14 @@ GameWindow::GameWindow(const std::filesystem::path& cardFolder,
         stageText.setFillColor(ld.error.load() ? sf::Color(220, 110, 110)
                                                 : sf::Color(199, 189, 172));
         stageText.setPosition(WIN_W * 0.5f - stageText.getLocalBounds().width * 0.5f, 380.f);
-        m_window.draw(stageText);
+        drawText(stageText);
 
         // Stage counter
         sf::Text counter(std::to_string(std::min(st + 1, kStageCount)) + " / " +
                          std::to_string(kStageCount), m_font, 12);
         counter.setFillColor(sf::Color(120, 113, 100));
         counter.setPosition(WIN_W * 0.5f - counter.getLocalBounds().width * 0.5f, 410.f);
-        m_window.draw(counter);
+        drawText(counter);
 
         // Progress bar
         const float barW = 600.f, barH = 12.f;
@@ -766,6 +766,18 @@ void GameWindow::launchCardCreator() {
 
 // ── View / fullscreen ─────────────────────────────────────────────────────────
 
+void GameWindow::drawText(sf::Text& t) {
+    // Re-rasterize the glyphs at viewport scale, draw, then restore so the
+    // object is unchanged for any later reuse/measurement. At g_uiScale <= 1
+    // applyTextScale is a no-op, so this is exactly a plain window draw.
+    unsigned     baseSize  = t.getCharacterSize();
+    sf::Vector2f baseScale = t.getScale();
+    ui::applyTextScale(t);
+    m_window.draw(t);
+    t.setCharacterSize(baseSize);
+    t.setScale(baseScale);
+}
+
 void GameWindow::updateView() {
     auto size = m_window.getSize();
     float scaleX = static_cast<float>(size.x) / WIN_W;
@@ -941,11 +953,11 @@ void GameWindow::run() {
                 hdr.setStyle(sf::Text::Bold);
                 hdr.setFillColor(sf::Color(230, 193, 112));
                 hdr.setPosition((WIN_W - 200.f) * 0.5f, (WIN_H - 100.f) * 0.5f + 8.f);
-                m_window.draw(hdr);
+                drawText(hdr);
                 sf::Text msg("Press R to restore autosave, or any other key to dismiss.", m_font, 10);
                 msg.setFillColor(sf::Color(199, 189, 172));
                 msg.setPosition((WIN_W - 340.f) * 0.5f, (WIN_H - 100.f) * 0.5f + 32.f);
-                m_window.draw(msg);
+                drawText(msg);
             }
 
             m_window.display();
@@ -1170,6 +1182,15 @@ void GameWindow::handleEvents() {
                 for (const auto& h : m_manaChoiceHits) {
                     if (h.rect.contains(pm)) {
                         completeManaChoice(h.color);
+                        break;
+                    }
+                }
+                continue;  // swallow click — overlay is modal
+            }
+            if (m_game.hasPendingChooseType()) {
+                for (const auto& h : m_chooseTypeHits) {
+                    if (h.rect.contains(pm)) {
+                        completeChooseType(h.type);
                         break;
                     }
                 }
@@ -1401,13 +1422,13 @@ void GameWindow::handleEvents() {
             };
             if (ev.key.code != sf::Keyboard::Unknown && ev.key.code == kb("my_gy") && !ev.key.control) {
                 if (m_zoneBrowseActive) { m_zoneBrowseActive = false; }
-                else { m_zoneBrowseActive = true; m_zoneBrowsePlayer = 0; m_zoneBrowseIsExile = false; m_renderer.invalidateZoneBrowserCache(); }
+                else { m_zoneBrowseActive = true; m_zoneBrowsePlayer = 0; m_zoneBrowseZone = ui::BrowseZone::Graveyard; m_renderer.invalidateZoneBrowserCache(); }
                 continue;
             }
             // H — toggle opponent GY browser (Bob's GY)
             if (ev.key.code != sf::Keyboard::Unknown && ev.key.code == kb("opp_gy") && !ev.key.control) {
                 if (m_zoneBrowseActive) { m_zoneBrowseActive = false; }
-                else { m_zoneBrowseActive = true; m_zoneBrowsePlayer = 1; m_zoneBrowseIsExile = false; m_renderer.invalidateZoneBrowserCache(); }
+                else { m_zoneBrowseActive = true; m_zoneBrowsePlayer = 1; m_zoneBrowseZone = ui::BrowseZone::Graveyard; m_renderer.invalidateZoneBrowserCache(); }
                 continue;
             }
             // Accept input on the human's turn OR whenever they have a
@@ -1848,7 +1869,7 @@ void GameWindow::handleEvents() {
             if (m_zoneBrowseActive) {
                 RenderHints tmpH; tmpH.showZoneBrowse = true;
                 tmpH.zoneBrowsePlayer = m_zoneBrowsePlayer;
-                tmpH.zoneBrowseIsExile = m_zoneBrowseIsExile;
+                tmpH.zoneBrowseZone = m_zoneBrowseZone;
                 if (m_renderer.hitZoneBrowserClose(px, py, tmpH)) {
                     m_zoneBrowseActive = false;
                 } else {
@@ -1864,9 +1885,10 @@ void GameWindow::handleEvents() {
                         // engine's castSpell / activate{Embalm,Eternalize,
                         // Scavenge} auto-pick the alt-cost.
                         if (m_zoneBrowsePlayer == 0 &&
+                            m_zoneBrowseZone != ui::BrowseZone::Library &&
                             m_turn == WhosTurn::Human &&
                             m_human.state() == HumanState::MainPhase) {
-                            ZoneType targetZone = m_zoneBrowseIsExile
+                            ZoneType targetZone = (m_zoneBrowseZone == ui::BrowseZone::Exile)
                                 ? ZoneType::Exile : ZoneType::Graveyard;
                             snapshotUndo();
                             if (m_human.onCardClick(clicked, targetZone, 0)) {
@@ -2123,14 +2145,14 @@ void GameWindow::handleEvents() {
                     auto zh = m_renderer.hitInfoBarZone(px, py);
                     if (zh.player >= 0) {
                         if (m_zoneBrowseActive &&
-                            m_zoneBrowsePlayer  == zh.player &&
-                            m_zoneBrowseIsExile == zh.isExile) {
+                            m_zoneBrowsePlayer == zh.player &&
+                            m_zoneBrowseZone   == zh.zone) {
                             // Clicking the same icon a second time closes it.
                             m_zoneBrowseActive = false;
                         } else {
                             m_zoneBrowseActive  = true;
                             m_zoneBrowsePlayer  = static_cast<uint8_t>(zh.player);
-                            m_zoneBrowseIsExile = zh.isExile;
+                            m_zoneBrowseZone    = zh.zone;
                             m_renderer.invalidateZoneBrowserCache();
                         }
                         continue;
@@ -2145,10 +2167,10 @@ void GameWindow::handleEvents() {
                     if (zi.player >= 0) {
                         bool same = m_zoneBrowseActive &&
                                     m_zoneBrowsePlayer == static_cast<uint8_t>(zi.player) &&
-                                    m_zoneBrowseIsExile == zi.isExile;
+                                    m_zoneBrowseZone   == zi.zone;
                         m_zoneBrowseActive  = !same;
                         m_zoneBrowsePlayer  = static_cast<uint8_t>(zi.player);
-                        m_zoneBrowseIsExile = zi.isExile;
+                        m_zoneBrowseZone    = zi.zone;
                         m_renderer.invalidateZoneBrowserCache();
                         continue;
                     }
@@ -2371,6 +2393,7 @@ void GameWindow::humanPriorityWindow() {
                m_game.hasPendingExploit()       ||
                m_game.hasPendingTribute()       ||
                m_game.hasPendingManaChoice()    || m_game.hasPendingScry()           ||
+               m_game.hasPendingChooseType()    ||
                m_abilities.hasPendingHumanTrigger() ||
                m_human.pendingPlaneswalker() != kInvalidId;
     };
@@ -2450,6 +2473,11 @@ void GameWindow::humanPriorityWindow() {
                 if (m_game.hasPendingManaChoice()) {
                     for (const auto& h : m_manaChoiceHits)
                         if (h.rect.contains(mapped)) { completeManaChoice(h.color); break; }
+                    continue;
+                }
+                if (m_game.hasPendingChooseType()) {
+                    for (const auto& h : m_chooseTypeHits)
+                        if (h.rect.contains(mapped)) { completeChooseType(h.type); break; }
                     continue;
                 }
                 if (m_game.hasPendingScry()) {
@@ -3035,12 +3063,12 @@ void GameWindow::drawPauseMenu() {
     title.setStyle(sf::Text::Bold);
     title.setFillColor(sf::Color(230, 193, 112));
     title.setPosition(px + (pw - title.getLocalBounds().width) * 0.5f, py + 18.f);
-    m_window.draw(title);
+    drawText(title);
 
     sf::Text hint("Press Esc to resume", m_font, 10);
     hint.setFillColor(sf::Color(148, 139, 124));
     hint.setPosition(px + (pw - hint.getLocalBounds().width) * 0.5f, py + 48.f);
-    m_window.draw(hint);
+    drawText(hint);
 
     // Buttons
     static const char* kLabels[] = { "Resume",
@@ -3071,7 +3099,7 @@ void GameWindow::drawPauseMenu() {
         auto b = lbl.getLocalBounds();
         lbl.setPosition(btnX + (btnW - b.width) * 0.5f - b.left,
                         by + i * (btnH + gap) + (btnH - b.height) * 0.5f - b.top);
-        m_window.draw(lbl);
+        drawText(lbl);
     }
 }
 
@@ -3452,7 +3480,7 @@ void GameWindow::renderSplitChoice() {
     title.setFillColor(sf::Color(180, 220, 190));
     auto tb = title.getLocalBounds();
     title.setPosition(px0 + (panW - tb.width) * 0.5f, py0 + 12.f);
-    m_window.draw(title);
+    drawText(title);
 
     // Two buttons: left half / right half
     const char* lName = r.name.c_str();
@@ -3481,19 +3509,19 @@ void GameWindow::renderSplitChoice() {
         nt.setFillColor(sf::Color(220, 235, 215));
         auto nb = nt.getLocalBounds();
         nt.setPosition(bx + (btnW - nb.width) * 0.5f, by0 + 8.f);
-        m_window.draw(nt);
+        drawText(nt);
         sf::Text ct(cost, m_font, 11);
         ct.setFillColor(sf::Color(180, 200, 160));
         auto cb2 = ct.getLocalBounds();
         ct.setPosition(bx + (btnW - cb2.width) * 0.5f, by0 + 34.f);
-        m_window.draw(ct);
+        drawText(ct);
     }
 
     sf::Text hint("[Esc to cancel]", m_font, 9);
     hint.setFillColor(sf::Color(80, 100, 80));
     auto hb = hint.getLocalBounds();
     hint.setPosition(px0 + (panW - hb.width) * 0.5f, py0 + panH - 18.f);
-    m_window.draw(hint);
+    drawText(hint);
 }
 
 void GameWindow::renderCardSearch() {
@@ -3525,12 +3553,12 @@ void GameWindow::renderCardSearch() {
     sf::Text qTxt(qDisplay, m_font, 11);
     qTxt.setFillColor(m_cardSearchQuery.empty() ? sf::Color(90, 110, 90) : sf::Color(200, 225, 200));
     qTxt.setPosition(px0 + 14.f, py0 + 14.f);
-    m_window.draw(qTxt);
+    drawText(qTxt);
 
     sf::Text hdr("Ctrl+F: Search  [Esc/Enter to close]", m_font, 9);
     hdr.setFillColor(sf::Color(80, 110, 80));
     hdr.setPosition(px0 + 14.f, py0 + boxH + 14.f);
-    m_window.draw(hdr);
+    drawText(hdr);
 
     if (m_cardSearchQuery.empty()) return;
 
@@ -3587,13 +3615,13 @@ void GameWindow::renderCardSearch() {
         nm.setStyle(sf::Text::Bold);
         nm.setFillColor(sf::Color(225, 230, 215));
         nm.setPosition(px0 + 12.f, ty + 4.f);
-        m_window.draw(nm);
+        drawText(nm);
 
         sf::Text zn("[" + m.zone + "]", m_font, 9);
         zn.setFillColor(sf::Color(130, 155, 130));
         auto zb = zn.getLocalBounds();
         zn.setPosition(px0 + pw - zb.width - 14.f, ty + 7.f);
-        m_window.draw(zn);
+        drawText(zn);
 
         ty += kRowH + kRowGap;
         ++shown;
@@ -3602,7 +3630,7 @@ void GameWindow::renderCardSearch() {
         sf::Text empty("No cards match \"" + m_cardSearchQuery + "\"", m_font, 10);
         empty.setFillColor(sf::Color(90, 100, 90));
         empty.setPosition(px0 + 14.f, ty + 8.f);
-        m_window.draw(empty);
+        drawText(empty);
     }
 }
 
@@ -3627,7 +3655,7 @@ void GameWindow::renderHelp() {
     title.setFillColor(sf::Color(160, 210, 180));
     auto tb = title.getLocalBounds();
     title.setPosition(px0 + (pw - tb.width) * 0.5f, py0 + 10.f);
-    m_window.draw(title);
+    drawText(title);
 
     static constexpr struct { const char* key; const char* desc; } kBindings[] = {
         { "Space / E",     "End Phase / Pass Priority" },
@@ -3654,11 +3682,11 @@ void GameWindow::renderHelp() {
         kTxt.setStyle(sf::Text::Bold);
         kTxt.setFillColor(sf::Color(210, 200, 140));
         kTxt.setPosition(px0 + 12.f, ty);
-        m_window.draw(kTxt);
+        drawText(kTxt);
         sf::Text dTxt(b.desc, m_font, 10);
         dTxt.setFillColor(sf::Color(180, 185, 180));
         dTxt.setPosition(px0 + 150.f, ty);
-        m_window.draw(dTxt);
+        drawText(dTxt);
         ty += 22.f;
     }
 }
@@ -3688,7 +3716,7 @@ void GameWindow::renderOptions() {
     title.setFillColor(sf::Color(180, 220, 190));
     auto tb = title.getLocalBounds();
     title.setPosition(px0 + (pw - tb.width) * 0.5f, py0 + 10.f);
-    m_window.draw(title);
+    drawText(title);
 
     // Fullscreen toggle button
     constexpr float btnW = 150.f, btnH = 28.f;
@@ -3705,7 +3733,7 @@ void GameWindow::renderOptions() {
     fsT.setFillColor(sf::Color(210, 230, 215));
     auto flb = fsT.getLocalBounds();
     fsT.setPosition(bx + (btnW - flb.width) * 0.5f, by + (btnH - flb.height) * 0.5f - 2.f);
-    m_window.draw(fsT);
+    drawText(fsT);
 
     // Colour-blind mode button
     float bx2 = px0 + pw - 14.f - btnW;
@@ -3719,7 +3747,7 @@ void GameWindow::renderOptions() {
     cbT.setFillColor(sf::Color(210, 230, 215));
     auto clb = cbT.getLocalBounds();
     cbT.setPosition(bx2 + (btnW - clb.width) * 0.5f, by + (btnH - clb.height) * 0.5f - 2.f);
-    m_window.draw(cbT);
+    drawText(cbT);
 
     // Phase stops section
     float ry = by + btnH + 18.f;
@@ -3727,7 +3755,7 @@ void GameWindow::renderOptions() {
     phHdr.setStyle(sf::Text::Bold);
     phHdr.setFillColor(sf::Color(160, 180, 165));
     phHdr.setPosition(px0 + 10.f, ry);
-    m_window.draw(phHdr);
+    drawText(phHdr);
     ry += 20.f;
 
     static constexpr const char* kNames[13] = {
@@ -3755,7 +3783,7 @@ void GameWindow::renderOptions() {
         sf::Text lbl(kNames[i], m_font, 10);
         lbl.setFillColor(isOn ? sf::Color(180, 230, 190) : sf::Color(120, 135, 120));
         lbl.setPosition(col + 14.f, rowY + 2.f);
-        m_window.draw(lbl);
+        drawText(lbl);
     }
 
     // ── Volume slider ──────────────────────────────────────────────────────────
@@ -3790,7 +3818,7 @@ void GameWindow::renderOptions() {
                         m_font, 9);
         volLbl.setFillColor(sf::Color(160, 180, 165));
         volLbl.setPosition(slX, sliderY - 14.f);
-        m_window.draw(volLbl);
+        drawText(volLbl);
 
         // Mute button
         float muteX = slX + slW + 8.f;
@@ -3804,14 +3832,14 @@ void GameWindow::renderOptions() {
         muteT.setFillColor(sf::Color(200, 215, 205));
         auto mb = muteT.getLocalBounds();
         muteT.setPosition(muteX + (32.f - mb.width) * 0.5f, sliderY);
-        m_window.draw(muteT);
+        drawText(muteT);
 
         // Priority chime toggle (one row below the volume slider)
         float chimeY = sliderY + 24.f;
         sf::Text chLbl("Priority chime:", m_font, 9);
         chLbl.setFillColor(sf::Color(160, 180, 165));
         chLbl.setPosition(slX, chimeY + 1.f);
-        m_window.draw(chLbl);
+        drawText(chLbl);
         float chBtnX = slX + 92.f;
         sf::RectangleShape chBtn({40.f, 16.f});
         chBtn.setPosition(chBtnX, chimeY - 1.f);
@@ -3823,7 +3851,7 @@ void GameWindow::renderOptions() {
         chT.setFillColor(sf::Color(200, 215, 205));
         auto chb = chT.getLocalBounds();
         chT.setPosition(chBtnX + (40.f - chb.width) * 0.5f, chimeY + 1.f);
-        m_window.draw(chT);
+        drawText(chT);
     }
 
     // Gameplay section
@@ -3837,14 +3865,14 @@ void GameWindow::renderOptions() {
         sf::Text gHdr("[Gameplay]", m_font, 10);
         gHdr.setFillColor(sf::Color(130, 150, 135));
         gHdr.setPosition(px0 + 14.f, gy);
-        m_window.draw(gHdr);
+        drawText(gHdr);
         gy += 14.f;
 
         // Auto-save interval
         sf::Text asHdr("Auto-save every N turns (0=off):", m_font, 9);
         asHdr.setFillColor(sf::Color(110, 130, 115));
         asHdr.setPosition(px0 + 14.f, gy);
-        m_window.draw(asHdr);
+        drawText(asHdr);
         for (int iv : {0, 3, 5, 10}) {
             float bx2 = px0 + 14.f + (iv == 0 ? 0.f : (iv == 3 ? 68.f : (iv == 5 ? 116.f : 156.f)));
             sf::RectangleShape btn2({48.f, 18.f});
@@ -3856,7 +3884,7 @@ void GameWindow::renderOptions() {
             sf::Text btnT((iv == 0 ? "OFF" : std::to_string(iv)), m_font, 8);
             btnT.setFillColor(m_autoSaveInterval == iv ? sf::Color(140,220,160) : sf::Color(100,120,105));
             btnT.setPosition(bx2 + 188.f, gy + 3.f);
-            m_window.draw(btnT);
+            drawText(btnT);
         }
     }
 
@@ -3870,7 +3898,7 @@ void GameWindow::renderOptions() {
         sf::Text resHdr("Window Size (restart needed):", m_font, 10);
         resHdr.setFillColor(sf::Color(130, 150, 135));
         resHdr.setPosition(px0 + 14.f, ry);
-        m_window.draw(resHdr);
+        drawText(resHdr);
         ry += 16.f;
         static const struct { unsigned w, h; const char* label; } kRes[] = {
             {1280, 720, "1280x720"}, {1560, 800, "1560x800 (default)"},
@@ -3888,7 +3916,7 @@ void GameWindow::renderOptions() {
             sf::Text rlt(kRes[ri].label, m_font, 8);
             rlt.setFillColor(cur ? sf::Color(140, 220, 160) : sf::Color(120, 140, 125));
             rlt.setPosition(px0 + 16.f + ri * 110.f, ry + 6.f);
-            m_window.draw(rlt);
+            drawText(rlt);
         }
     }
 }
@@ -4018,7 +4046,7 @@ void GameWindow::renderTurnHistory() {
     hdr.setStyle(sf::Text::Bold);
     hdr.setFillColor(sf::Color(230, 193, 112));
     hdr.setPosition(px0 + 10.f, py0 + 8.f);
-    m_window.draw(hdr);
+    drawText(hdr);
 
     float ry = py0 + 30.f;
     int start = std::max(0, (int)m_turnHistory.size() - 14);
@@ -4032,14 +4060,14 @@ void GameWindow::renderTurnHistory() {
         sf::Text tl(summary, m_font, 10);
         tl.setFillColor(col);
         tl.setPosition(px0 + 8.f, ry);
-        m_window.draw(tl);
+        drawText(tl);
         ry += 13.f;
         // Show notable cards
         for (size_t ci = 0; ci < std::min((size_t)2, ts.notableCards.size()); ++ci) {
             sf::Text cl("  " + ts.notableCards[ci], m_font, 8);
             cl.setFillColor(sf::Color(148, 139, 124));
             cl.setPosition(px0 + 8.f, ry);
-            m_window.draw(cl);
+            drawText(cl);
             ry += 11.f;
         }
     }
@@ -4067,7 +4095,7 @@ void GameWindow::renderLifeChart() {
     hdr.setStyle(sf::Text::Bold);
     hdr.setFillColor(sf::Color(230, 193, 112));
     hdr.setPosition(px0 + 10.f, py0 + 8.f);
-    m_window.draw(hdr);
+    drawText(hdr);
 
     float chartX = px0 + 30.f, chartY = py0 + 35.f;
     float chartW = pw - 50.f, chartH = ph - 55.f;
@@ -4098,7 +4126,7 @@ void GameWindow::renderLifeChart() {
         sf::Text gt(std::to_string(lifeLabel), m_font, 8);
         gt.setFillColor(sf::Color(100, 95, 85));
         gt.setPosition(px0 + 4.f, gy - 5.f);
-        m_window.draw(gt);
+        drawText(gt);
     }
 
     // Draw life lines for each player
@@ -4116,7 +4144,7 @@ void GameWindow::renderLifeChart() {
         sf::Text lt(label, m_font, 9);
         lt.setFillColor(cols[pid]);
         lt.setPosition(chartX + chartW + 4.f, (pid == 0 ? chartY : chartY + 14.f));
-        m_window.draw(lt);
+        drawText(lt);
     }
 }
 
@@ -4151,7 +4179,7 @@ void GameWindow::renderGoldfishOverlay() {
     info.setFillColor(sf::Color(203, 163, 90));
     info.setPosition(10.f, 6.f);
     ui::applyTextScale(info);
-    m_window.draw(info);
+    drawText(info);
 }
 
 void GameWindow::showToast(const std::string& msg, float duration) {
@@ -4181,7 +4209,7 @@ void GameWindow::renderToast() {
     txt.setPosition(PLAY_X + PLAY_W * 0.2f + (PLAY_W * 0.6f - tb.width) * 0.5f - tb.left,
                     BOB_INFO_Y + BOB_INFO_H + 6.f + (H - tb.height) * 0.5f - tb.top);
     ui::applyTextScale(txt);
-    m_window.draw(txt);
+    drawText(txt);
 }
 
 // ── Statistics overlay ────────────────────────────────────────────────────────
@@ -4209,7 +4237,7 @@ void GameWindow::renderStatsOverlay() {
         t.setFillColor(col);
         t.setPosition(x, y);
         ui::applyTextScale(t);
-        m_window.draw(t);
+        drawText(t);
     };
 
     drawLine("SESSION STATISTICS", px0 + 16.f, py0 + 12.f, 16, sf::Color(230, 193, 112), true);
@@ -4348,7 +4376,7 @@ void GameWindow::renderAchievementsOverlay() {
         t.setFillColor(col);
         t.setPosition(x, y);
         ui::applyTextScale(t);
-        m_window.draw(t);
+        drawText(t);
     };
 
     int unlocked = 0;
@@ -4393,7 +4421,7 @@ void GameWindow::renderCollectionStats() {
         t.setFillColor(col);
         t.setPosition(x, y);
         ui::applyTextScale(t);
-        m_window.draw(t);
+        drawText(t);
     };
 
     drawL("COLLECTION STATISTICS  (Ctrl+Q to close)", px0+14.f, py0+10.f, 13,
@@ -4643,7 +4671,7 @@ void GameWindow::renderMulligan() {
     auto ib = instr.getLocalBounds();
     instr.setPosition(OX + (OW - ib.width) * 0.5f, OY + 12.f);
     ui::applyTextScale(instr);
-    m_window.draw(instr);
+    drawText(instr);
 
     // AI status
     std::string aiTxt = "Bob: keeps";
@@ -4654,7 +4682,7 @@ void GameWindow::renderMulligan() {
     aiSt.setFillColor(sf::Color(160, 170, 160));
     aiSt.setPosition(OX + 10.f, OY + 40.f);
     ui::applyTextScale(aiSt);
-    m_window.draw(aiSt);
+    drawText(aiSt);
 
     // Hand size
     size_t handSz = m_game.player(0).hand().size();
@@ -4663,7 +4691,7 @@ void GameWindow::renderMulligan() {
     auto hb = hsSt.getLocalBounds();
     hsSt.setPosition(OX + OW - hb.width - 10.f, OY + 40.f);
     ui::applyTextScale(hsSt);
-    m_window.draw(hsSt);
+    drawText(hsSt);
 
     const float btnY = WIN_H * 0.5f - 22.f;
     const float btnH = 44.f;
@@ -4688,7 +4716,7 @@ void GameWindow::renderMulligan() {
         ctxt.setPosition(confirmX + (btnW - cb.width) * 0.5f,
                          confirmY + (btnH - cb.height) * 0.5f - 2.f);
         ui::applyTextScale(ctxt);
-        m_window.draw(ctxt);
+        drawText(ctxt);
     } else {
         const float keepX = PLAY_X + PLAY_W * 0.65f - btnW * 0.5f;
         const float mullX = PLAY_X + PLAY_W * 0.35f - btnW * 0.5f;
@@ -4707,7 +4735,7 @@ void GameWindow::renderMulligan() {
         kt.setPosition(keepX + (btnW - klb.width) * 0.5f,
                        btnY  + (btnH - klb.height) * 0.5f - 2.f);
         ui::applyTextScale(kt);
-        m_window.draw(kt);
+        drawText(kt);
 
         // MULLIGAN button
         sf::RectangleShape mb({btnW, btnH});
@@ -4723,7 +4751,7 @@ void GameWindow::renderMulligan() {
         mt.setPosition(mullX + (btnW - mlb.width) * 0.5f,
                        btnY  + (btnH - mlb.height) * 0.5f - 2.f);
         ui::applyTextScale(mt);
-        m_window.draw(mt);
+        drawText(mt);
     }
 
     m_window.display();
@@ -4941,6 +4969,18 @@ void GameWindow::completeManaChoice(char color) {
     pool.add(sh, choice.amount);
 }
 
+void GameWindow::completeChooseType(const std::string& type) {
+    if (!m_game.hasPendingChooseType()) return;
+    const auto choice = m_game.pendingChooseType();  // copy before clearing
+    m_game.clearPendingChooseType();
+    if (Card* c = m_game.findCard(choice.cardId))
+        c->chosenType = type;
+    // Mirror to the global slot for any consumer that reads chosenTypeName.
+    m_game.chosenTypeName = type;
+    m_game.recomputeStaticBonuses();
+    addLog("Chose creature type: " + type + ".");
+}
+
 void GameWindow::completeScryChoice(bool keepTop) {
     if (!m_game.hasPendingScry()) return;
     auto& sc = m_game.pendingScry();
@@ -4956,7 +4996,7 @@ void GameWindow::completeScryChoice(bool keepTop) {
         Player& p = m_game.player(sc.controller);
         for (auto it = sc.keepTop.rbegin(); it != sc.keepTop.rend(); ++it) {
             Card* c = m_game.findCard(*it);
-            if (c) p.library().addToFront(c);
+            if (c) { c->revealedToOwner = true; p.library().addToFront(c); }
         }
         for (ObjectId bid : sc.putBottom) {
             Card* c = m_game.findCard(bid);
@@ -5072,7 +5112,7 @@ void GameWindow::render() {
     // Zone browser overlay state
     hints.showZoneBrowse    = m_zoneBrowseActive;
     hints.zoneBrowsePlayer  = m_zoneBrowsePlayer;
-    hints.zoneBrowseIsExile = m_zoneBrowseIsExile;
+    hints.zoneBrowseZone    = m_zoneBrowseZone;
 
     // Populate phase-stop toggle state for the phase tracker UI
     hints.stepStops = {
@@ -5190,7 +5230,7 @@ void GameWindow::render() {
         title.setFillColor(sf::Color(200, 215, 235));
         auto tb = title.getLocalBounds();
         title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 35.f);
-        m_window.draw(title);
+        drawText(title);
         const char* riotLabels[2] = { "Haste", "+1/+1 Counter" };
         for (int i = 0; i < 2; ++i) {
             float bx = startX + i * (btnW + gap);
@@ -5205,7 +5245,7 @@ void GameWindow::render() {
             lt.setFillColor(sf::Color(200, 220, 240));
             auto lb = lt.getLocalBounds();
             lt.setPosition(bx + (btnW - lb.width) * 0.5f, startY + (btnH - lb.height) * 0.5f - 2.f);
-            m_window.draw(lt);
+            drawText(lt);
         }
         m_window.display();
         return;
@@ -5234,7 +5274,7 @@ void GameWindow::render() {
         title.setFillColor(sf::Color(200, 215, 235));
         auto tb = title.getLocalBounds();
         title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 35.f);
-        m_window.draw(title);
+        drawText(title);
         std::string l0 = "Pay " + std::to_string(amt) + " life (untapped)";
         const std::string labels[2] = { l0, "Enter tapped" };
         for (int i = 0; i < 2; ++i) {
@@ -5250,7 +5290,7 @@ void GameWindow::render() {
             lt.setFillColor(sf::Color(200, 220, 240));
             auto lb = lt.getLocalBounds();
             lt.setPosition(bx + (btnW - lb.width) * 0.5f, startY + (btnH - lb.height) * 0.5f - 2.f);
-            m_window.draw(lt);
+            drawText(lt);
         }
         m_window.display();
         return;
@@ -5277,7 +5317,7 @@ void GameWindow::render() {
         title.setFillColor(sf::Color(200, 235, 215));
         auto tb = title.getLocalBounds();
         title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 35.f);
-        m_window.draw(title);
+        drawText(title);
         const char* fabLabels[2] = { "Create Servo Tokens", "+1/+1 Counters" };
         for (int i = 0; i < 2; ++i) {
             float bx = startX + i * (btnW + gap);
@@ -5292,7 +5332,7 @@ void GameWindow::render() {
             lt.setFillColor(sf::Color(200, 235, 215));
             auto lb = lt.getLocalBounds();
             lt.setPosition(bx + (btnW - lb.width) * 0.5f, startY + (btnH - lb.height) * 0.5f - 2.f);
-            m_window.draw(lt);
+            drawText(lt);
         }
         m_window.display();
         return;
@@ -5319,7 +5359,7 @@ void GameWindow::render() {
         title.setFillColor(sf::Color(235, 215, 200));
         auto tb = title.getLocalBounds();
         title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 35.f);
-        m_window.draw(title);
+        drawText(title);
         const char* madnessLabels[2] = { "Cast (Madness)", "Put in Graveyard" };
         for (int i = 0; i < 2; ++i) {
             float bx = startX + i * (btnW + gap);
@@ -5334,7 +5374,7 @@ void GameWindow::render() {
             lt.setFillColor(sf::Color(235, 215, 200));
             auto lb = lt.getLocalBounds();
             lt.setPosition(bx + (btnW - lb.width) * 0.5f, startY + (btnH - lb.height) * 0.5f - 2.f);
-            m_window.draw(lt);
+            drawText(lt);
         }
         m_window.display();
         return;
@@ -5364,7 +5404,7 @@ void GameWindow::render() {
             title.setFillColor(sf::Color(200, 215, 235));
             auto tb = title.getLocalBounds();
             title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 38.f);
-            m_window.draw(title);
+            drawText(title);
             for (int i = 0; i < n; ++i) {
                 float bx = startX + i * (btnW + gap);
                 sf::RectangleShape btn({btnW, btnH});
@@ -5379,7 +5419,7 @@ void GameWindow::render() {
                 auto lb = lt.getLocalBounds();
                 lt.setPosition(bx + (btnW - lb.width) * 0.5f,
                                startY + (btnH - lb.height) * 0.5f - 2.f);
-                m_window.draw(lt);
+                drawText(lt);
             }
         }
         m_window.display();
@@ -5408,7 +5448,7 @@ void GameWindow::render() {
             title.setFillColor(sf::Color(200, 215, 235));
             auto tb = title.getLocalBounds();
             title.setPosition(startX - 20.f + (panW - tb.width) * 0.5f, startY - 35.f);
-            m_window.draw(title);
+            drawText(title);
             for (int i = 0; i < n; ++i) {
                 float bx = startX + i * (btnW + gap);
                 sf::RectangleShape btn({btnW, btnH});
@@ -5425,7 +5465,7 @@ void GameWindow::render() {
                 auto lb = lt.getLocalBounds();
                 lt.setPosition(bx + (btnW - lb.width) * 0.5f,
                                startY + (btnH - lb.height) * 0.5f - 2.f);
-                m_window.draw(lt);
+                drawText(lt);
             }
         }
         m_window.display();
@@ -5451,7 +5491,7 @@ void GameWindow::render() {
         sf::Text fpsText(fpsBuf, m_font, 10);
         fpsText.setFillColor(sf::Color(180, 230, 180));
         fpsText.setPosition(6.f, 5.f);
-        m_window.draw(fpsText);
+        drawText(fpsText);
     }
 
     // Stats, achievements, and collection overlays
@@ -5495,12 +5535,12 @@ void GameWindow::render() {
                 nm.setStyle(sf::Text::Bold);
                 nm.setFillColor(sf::Color(230, 193, 112));
                 nm.setPosition((WIN_W - 200.f) * 0.5f, WIN_H * 0.5f);
-                m_window.draw(nm);
+                drawText(nm);
             }
             sf::Text hint("Ctrl+right-click or Esc to close", m_font, 10);
             hint.setFillColor(sf::Color(100, 95, 85));
             hint.setPosition(WIN_W * 0.5f - 100.f, WIN_H - 20.f);
-            m_window.draw(hint);
+            drawText(hint);
         } else {
             m_artZoomCardId = kInvalidId;
         }
@@ -5555,7 +5595,7 @@ void GameWindow::render() {
                     t2.setFillColor(col);
                     t2.setPosition(tx + 8.f, ty);
                     ui::applyTextScale(t2);
-                    m_window.draw(t2);
+                    drawText(t2);
                     ty += sz + 3.f;
                 }
             };
@@ -5593,7 +5633,7 @@ void GameWindow::render() {
                 rlHdr.setStyle(sf::Text::Bold);
                 rlHdr.setFillColor(sf::Color(203, 163, 90));
                 rlHdr.setPosition(rlX + 8.f, rlY + 4.f);
-                m_window.draw(rlHdr);
+                drawText(rlHdr);
                 float rty = rlY + 18.f;
                 for (const auto& r : m_cachedRulings) {
                     if (rty > rlY + rlH - 12.f) break;
@@ -5611,7 +5651,7 @@ void GameWindow::render() {
                         sf::Text rt2(line, m_font, 9);
                         rt2.setFillColor(sf::Color(190, 183, 170));
                         rt2.setPosition(rlX + 8.f, rty);
-                        m_window.draw(rt2);
+                        drawText(rt2);
                         rty += 12.f;
                     }
                     rty += 3.f;
@@ -5622,7 +5662,7 @@ void GameWindow::render() {
             sf::Text hint("Right-click or Esc to close  |  R = Scryfall rulings", m_font, 9);
             hint.setFillColor(sf::Color(100, 95, 85));
             hint.setPosition(zx, zy + panH + 6.f);
-            m_window.draw(hint);
+            drawText(hint);
         } else {
             m_zoomCardId = kInvalidId;
         }
@@ -5666,7 +5706,7 @@ void GameWindow::render() {
             nameText.setStyle(sf::Text::Bold);
             nameText.setFillColor(sf::Color(220, 210, 190));
             nameText.setPosition(x + pad, y + 4.f);
-            m_window.draw(nameText);
+            drawText(nameText);
 
             sf::RectangleShape cancelBtn({cancelW, headerH - 2.f});
             cancelBtn.setPosition(x + panelW - cancelW - 4.f, y + 4.f);
@@ -5678,7 +5718,7 @@ void GameWindow::render() {
             auto cb = cancelText.getLocalBounds();
             cancelText.setPosition(x + panelW - cancelW - 4.f + (cancelW - cb.width) * 0.5f - cb.left,
                                    y + 4.f + (headerH - 2.f - cb.height) * 0.5f - cb.top);
-            m_window.draw(cancelText);
+            drawText(cancelText);
             m_castPopupCancelRect = sf::FloatRect(x + panelW - cancelW - 4.f, y + 4.f,
                                                   cancelW, headerH - 2.f);
 
@@ -5701,7 +5741,7 @@ void GameWindow::render() {
                 lbl.setStyle(sf::Text::Bold);
                 lbl.setFillColor(txt);
                 lbl.setPosition(r.left + 10.f, r.top + 4.f);
-                m_window.draw(lbl);
+                drawText(lbl);
 
                 // Mana cost as pips (fall back to text if no skin is loaded).
                 if (SkinAssets::ready() && m.costStr.find('{') != std::string::npos) {
@@ -5719,7 +5759,7 @@ void GameWindow::render() {
                     costT.setFillColor(txt);
                     float cw = costT.getLocalBounds().width;
                     costT.setPosition(r.left + r.width - cw - 10.f, r.top + 5.f);
-                    m_window.draw(costT);
+                    drawText(costT);
                 }
 
                 m_castPopupHits.push_back({r, m.kind});
@@ -5732,20 +5772,20 @@ void GameWindow::render() {
                 sf::Text foot("Pool:", m_font, 11);
                 foot.setFillColor(sf::Color(170, 165, 150));
                 foot.setPosition(x + pad, fy);
-                m_window.draw(foot);
+                drawText(foot);
                 float px2 = x + pad + foot.getLocalBounds().width + 6.f;
                 if (poolStr.empty()) {
                     sf::Text empt("(empty)", m_font, 11);
                     empt.setFillColor(sf::Color(140, 135, 122));
                     empt.setPosition(px2, fy);
-                    m_window.draw(empt);
+                    drawText(empt);
                 } else if (SkinAssets::ready()) {
                     SkinAssets::drawManaCost(m_window, poolStr, px2, fy - 2.f, 14.f);
                 } else {
                     sf::Text pl(poolStr, m_font, 11);
                     pl.setFillColor(sf::Color(170, 165, 150));
                     pl.setPosition(px2, fy);
-                    m_window.draw(pl);
+                    drawText(pl);
                 }
             }
         }
@@ -5773,7 +5813,7 @@ void GameWindow::render() {
         hdr.setFillColor(sf::Color(230, 220, 200));
         auto hb = hdr.getLocalBounds();
         hdr.setPosition(x + (w - hb.width) * 0.5f, y + 4.f);
-        m_window.draw(hdr);
+        drawText(hdr);
         float bx = x + pad;
         const float by = y + hdrH;
         for (char col : mc.colors) {
@@ -5798,9 +5838,52 @@ void GameWindow::render() {
             auto lb = lbl.getLocalBounds();
             lbl.setPosition(bx + (bw - lb.width) * 0.5f - lb.left,
                             by + (bh - lb.height) * 0.5f - lb.top);
-            m_window.draw(lbl);
+            drawText(lbl);
             m_manaChoiceHits.push_back({sf::FloatRect(bx, by, bw, bh), col});
             bx += bw + pad;
+        }
+    }
+
+    // ── Choose-a-creature-type overlay (Herald's Horn ETB) ───────────────────
+    // A vertical list of candidate creature types; click one to set the chosen
+    // type on the entering permanent.
+    m_chooseTypeHits.clear();
+    if (m_game.hasPendingChooseType()) {
+        const auto& ct = m_game.pendingChooseType();
+        constexpr float bw = 200.f, bh = 26.f, pad = 6.f, hdrH = 24.f;
+        const size_t n = ct.options.size();
+        const float w = bw + pad * 2.f;
+        const float h = hdrH + pad + (bh + pad) * static_cast<float>(n) + pad;
+        const float x = (WIN_W - w) * 0.5f;
+        const float y = (WIN_H - h) * 0.5f;
+        sf::RectangleShape pan({w, h});
+        pan.setPosition(x, y);
+        pan.setFillColor(sf::Color(18, 17, 16, 245));
+        pan.setOutlineColor(sf::Color(203, 163, 90));
+        pan.setOutlineThickness(2.f);
+        m_window.draw(pan);
+        sf::Text hdr("Choose a creature type:", m_font, 13);
+        hdr.setStyle(sf::Text::Bold);
+        hdr.setFillColor(sf::Color(230, 220, 200));
+        auto hb = hdr.getLocalBounds();
+        hdr.setPosition(x + (w - hb.width) * 0.5f, y + 5.f);
+        drawText(hdr);
+        float by = y + hdrH + pad;
+        for (const auto& type : ct.options) {
+            sf::RectangleShape btn({bw, bh});
+            btn.setPosition(x + pad, by);
+            btn.setFillColor(sf::Color(44, 34, 14));
+            btn.setOutlineColor(sf::Color(110, 90, 50));
+            btn.setOutlineThickness(1.f);
+            m_window.draw(btn);
+            sf::Text lbl(type, m_font, 14);
+            lbl.setFillColor(sf::Color(230, 193, 112));
+            auto lb = lbl.getLocalBounds();
+            lbl.setPosition(x + pad + (bw - lb.width) * 0.5f - lb.left,
+                            by + (bh - lb.height) * 0.5f - lb.top);
+            drawText(lbl);
+            m_chooseTypeHits.push_back({sf::FloatRect(x + pad, by, bw, bh), type});
+            by += bh + pad;
         }
     }
 
@@ -5834,14 +5917,14 @@ void GameWindow::render() {
                 hdrT.setStyle(sf::Text::Bold);
                 hdrT.setFillColor(sf::Color(230, 193, 112));
                 hdrT.setPosition(x + pad, y + 4.f);
-                m_window.draw(hdrT);
+                drawText(hdrT);
 
                 sf::Text nm(sf::String::fromUtf8(c->rules->name.begin(), c->rules->name.end()),
                             m_font, 14);
                 nm.setStyle(sf::Text::Bold);
                 nm.setFillColor(sf::Color(230, 220, 200));
                 nm.setPosition(x + pad, y + 24.f);
-                m_window.draw(nm);
+                drawText(nm);
 
                 std::string cost = c->rules->manaCost.toString();
                 std::string typeLine;
@@ -5851,7 +5934,7 @@ void GameWindow::render() {
                 sf::Text metaT(meta, m_font, 11);
                 metaT.setFillColor(sf::Color(170, 165, 150));
                 metaT.setPosition(x + pad, y + 44.f);
-                m_window.draw(metaT);
+                drawText(metaT);
 
                 if (!c->rules->oracleText.empty()) {
                     std::string oracle = c->rules->oracleText;
@@ -5859,7 +5942,7 @@ void GameWindow::render() {
                     sf::Text otext(oracle, m_font, 10);
                     otext.setFillColor(sf::Color(180, 175, 160));
                     otext.setPosition(x + pad, y + 64.f);
-                    m_window.draw(otext);
+                    drawText(otext);
                 }
 
                 const float by = y + h - btnH - pad;
@@ -5876,7 +5959,7 @@ void GameWindow::render() {
                 auto kb = keepT.getLocalBounds();
                 keepT.setPosition(x + pad + (bw - kb.width) * 0.5f - kb.left,
                                   by + (btnH - kb.height) * 0.5f - kb.top);
-                m_window.draw(keepT);
+                drawText(keepT);
                 m_scryKeepRect = sf::FloatRect(x + pad, by, bw, btnH);
 
                 sf::RectangleShape bot({bw, btnH});
@@ -5891,7 +5974,7 @@ void GameWindow::render() {
                 auto bb = botT.getLocalBounds();
                 botT.setPosition(x + pad + bw + gap + (bw - bb.width) * 0.5f - bb.left,
                                  by + (btnH - bb.height) * 0.5f - bb.top);
-                m_window.draw(botT);
+                drawText(botT);
                 m_scryBottomRect = sf::FloatRect(x + pad + bw + gap, by, bw, btnH);
             }
         }
@@ -5925,7 +6008,7 @@ void GameWindow::render() {
         hdr.setStyle(sf::Text::Bold);
         hdr.setFillColor(sf::Color(230, 220, 200));
         hdr.setPosition(x + pad, y + 4.f);
-        m_window.draw(hdr);
+        drawText(hdr);
 
         // Cancel "X" top-right
         sf::RectangleShape cancel({cancelW, headerH - 2.f});
@@ -5938,7 +6021,7 @@ void GameWindow::render() {
         auto cb = cx.getLocalBounds();
         cx.setPosition(x + panelW - cancelW - 4.f + (cancelW - cb.width) * 0.5f - cb.left,
                        y + 4.f + (headerH - 2.f - cb.height) * 0.5f - cb.top);
-        m_window.draw(cx);
+        drawText(cx);
         m_manaAbilityCancelRect = sf::FloatRect(x + panelW - cancelW - 4.f, y + 4.f,
                                                 cancelW, headerH - 2.f);
 
@@ -5973,7 +6056,7 @@ void GameWindow::render() {
                         lbl.setStyle(sf::Text::Bold);
                         lbl.setFillColor(col);
                         lbl.setPosition(lx, r.top + 5.f);
-                        m_window.draw(lbl);
+                        drawText(lbl);
                         lx += lbl.getLocalBounds().left + lbl.getLocalBounds().width + 2.f;
                         i = (j == std::string::npos ? s.size() : j);
                     }
@@ -6023,7 +6106,7 @@ void GameWindow::renderGameOver() {
         auto lb = headline.getLocalBounds();
         headline.setPosition(panX + (panW - lb.width) * 0.5f, panY + 24.f);
         ui::applyTextScale(headline);
-        m_window.draw(headline);
+        drawText(headline);
     }
 
     // Life total summary
@@ -6037,7 +6120,7 @@ void GameWindow::renderGameOver() {
         auto lb = sumTxt.getLocalBounds();
         sumTxt.setPosition(panX + (panW - lb.width) * 0.5f, panY + 100.f);
         ui::applyTextScale(sumTxt);
-        m_window.draw(sumTxt);
+        drawText(sumTxt);
     }
 
     // Win/loss record for this matchup
@@ -6062,7 +6145,7 @@ void GameWindow::renderGameOver() {
             auto lb2 = recTxt.getLocalBounds();
             recTxt.setPosition(panX + (panW - lb2.width) * 0.5f, panY + 132.f);
             ui::applyTextScale(recTxt);
-            m_window.draw(recTxt);
+            drawText(recTxt);
         }
     }
 
@@ -6079,7 +6162,7 @@ void GameWindow::renderGameOver() {
         auto lb3 = statTxt.getLocalBounds();
         statTxt.setPosition(panX + (panW - lb3.width) * 0.5f - lb3.left, panY + 162.f);
         ui::applyTextScale(statTxt);
-        m_window.draw(statTxt);
+        drawText(statTxt);
     }
 
     // Buttons — "Play Again [R]" and "Main Menu [Esc]"
@@ -6101,7 +6184,7 @@ void GameWindow::renderGameOver() {
         lt.setPosition(bx + (btnW - lb.width) * 0.5f,
                        btnY + (btnH - lb.height) * 0.5f - 2.f);
         ui::applyTextScale(lt);
-        m_window.draw(lt);
+        drawText(lt);
     };
 
     // Tournament score bar
@@ -6115,7 +6198,7 @@ void GameWindow::renderGameOver() {
         ms.setFillColor(sf::Color(200, 220, 150));
         auto mb = ms.getLocalBounds();
         ms.setPosition(panX + (panW - mb.width) * 0.5f, panY + 152.f);
-        m_window.draw(ms);
+        drawText(ms);
     }
 
     // ── Per-game statistics ────────────────────────────────────────────────────
@@ -6128,7 +6211,7 @@ void GameWindow::renderGameOver() {
         statsT.setFillColor(sf::Color(150, 165, 150));
         auto sb = statsT.getLocalBounds();
         statsT.setPosition(panX + (panW - sb.width) * 0.5f, panY + 132.f);
-        m_window.draw(statsT);
+        drawText(statsT);
 
         // Poison / commander damage summary if relevant
         std::string extra;
@@ -6147,7 +6230,7 @@ void GameWindow::renderGameOver() {
             et.setFillColor(sf::Color(140, 150, 130));
             auto eb = et.getLocalBounds();
             et.setPosition(panX + (panW - eb.width) * 0.5f, panY + 146.f);
-            m_window.draw(et);
+            drawText(et);
         }
     }
 
@@ -6171,7 +6254,7 @@ void GameWindow::renderGameOver() {
             t.setFillColor(sf::Color(140, 165, 195));
             auto rb = t.getLocalBounds();
             t.setPosition(bx + (repW - rb.width) * 0.5f - rb.left, repY + 5.f);
-            m_window.draw(t);
+            drawText(t);
         };
         drawSmallBtn("Save Replay  [Ctrl+R]", repX0);
         drawSmallBtn("Load Replay",            repX0 + repW + repGap);

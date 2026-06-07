@@ -138,6 +138,18 @@ struct Card {
     // Persists while the card is on the battlefield; cleared on zone change (new Card object).
     std::string namedCard;
 
+    // True when this card (while in a library) is known to its owner — e.g. the
+    // top card after a scry/peek/"look at the top card" effect. The zone browser
+    // shows known library cards face-up and unknown ones as card backs. Reset on
+    // shuffle / zone change (a new Card object is created on most zone moves).
+    bool revealedToOwner = false;
+
+    // ChosenType: creature type chosen as this permanent entered ("As CARDNAME
+    // enters, choose a creature type" — Herald's Horn). Read by the
+    // Creature.ChosenType filter so the cost reduction / upkeep peek only affect
+    // the chosen type. Per-card so multiple choosers don't clobber each other.
+    std::string chosenType;
+
     // MinMaxBlocker: maximum number of creatures that may block this permanent.
     // INT_MAX = no restriction. Set by S:Mode$ MinMaxBlocker in recomputeStaticBonuses.
     int maxBlockerCount = INT_MAX;

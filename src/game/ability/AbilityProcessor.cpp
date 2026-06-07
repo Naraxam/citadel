@@ -217,6 +217,93 @@ bool AbilityProcessor::activateManaAbility(ObjectId sourceId, uint8_t controller
     return false;
 }
 
+// ── Cost reduction ──────────────────────────────────────────────────────────
+
+int AbilityProcessor::genericReductionFor(const Card& spell,
+                                          uint8_t controller) const {
+    if (!spell.rules) return 0;
+    int discount  = 0;
+    int surcharge = 0;
+
+    // Amount$/Cost$ may be a digit string or an SVar name on the source card.
+    auto resolveAmount = [&](std::string_view amountStr, const Card* srcCard) -> int {
+        if (amountStr.empty()) return 1;
+        if (std::isdigit(static_cast<unsigned char>(amountStr[0]))) {
+            int v = 0;
+            std::from_chars(amountStr.data(), amountStr.data() + amountStr.size(), v);
+            return v;
+        }
+        return m_game.evaluateSVar(std::string(amountStr), srcCard->controllerId,
+                                   srcCard->rules, srcCard->id);
+    };
+
+    // IsPresent$ condition on a static ability.
+    auto checkIsPresent = [&](const ScriptLine& s, ObjectId srcId) -> bool {
+        auto isPresent = s.get("IsPresent", "");
+        if (isPresent.empty()) return true;
+        auto presentCmp = s.get("PresentCompare", "GE1");
+        int count = 0;
+        const Card* srcCard2 = m_game.findCard(srcId);
+        for (const Card* c2 : m_game.battlefield().cards())
+            if (cardMatchesAnyFilter(*c2, std::string(isPresent),
+                                     controller, srcId, srcCard2, &m_game)) ++count;
+        if (presentCmp.size() < 3) return count >= 1;
+        auto op = presentCmp.substr(0, 2);
+        int n = 0;
+        std::from_chars(presentCmp.data() + 2,
+                        presentCmp.data() + presentCmp.size(), n);
+        if (op == "GE") return count >= n;
+        if (op == "LE") return count <= n;
+        if (op == "EQ") return count == n;
+        if (op == "GT") return count >  n;
+        if (op == "LT") return count <  n;
+        return false;
+    };
+
+    // Process S: lines on srcCard for ReduceCost/RaiseCost. isSelf=true means the
+    // source is the spell card itself (its EffectZone$ All/Hand/Stack applies).
+    auto processLines = [&](const std::vector<std::string>& lines,
+                            const Card* srcCard, bool isSelf) {
+        for (const auto& raw : lines) {
+            auto s = parseScriptLine(raw);
+            auto mode = s.get("Mode", "");
+            bool isReduce = (mode == "ReduceCost");
+            bool isRaise  = (mode == "RaiseCost");
+            if (!isReduce && !isRaise) continue;
+
+            auto ez = s.get("EffectZone", isSelf ? "All" : "Battlefield");
+            if (ez != "All" && !(isSelf && (ez == "Hand" || ez == "Stack")))
+                if (!srcCard->isOnBattlefield()) continue;
+
+            auto activator = s.get("Activator", "");
+            if (!activator.empty() && activator == "You")
+                if (srcCard->controllerId != controller) continue;
+
+            auto validCard = s.get("ValidCard", "");
+            if (!validCard.empty()) {
+                if (!cardMatchesAnyFilter(spell, std::string(validCard),
+                                          controller, srcCard->id, srcCard, &m_game))
+                    continue;
+            }
+
+            if (!checkIsPresent(s, srcCard->id)) continue;
+
+            int amount = resolveAmount(
+                isReduce ? s.get("Amount", "1") : s.get("Cost", "1"), srcCard);
+            if (amount <= 0) continue;
+
+            if (isReduce) discount  += amount;
+            else          surcharge += amount;
+        }
+    };
+
+    processLines(spell.rules->staticAbilityLines, &spell, true);
+    for (const Card* bf : m_game.battlefield().cards())
+        processLines(bf->rules->staticAbilityLines, bf, false);
+
+    return discount - surcharge;
+}
+
 // ── Spell casting ─────────────────────────────────────────────────────────────
 
 bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
@@ -786,116 +873,16 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
         if (toAdd > 0) pool.addGeneric(toAdd);
     }
 
-    // S:Mode$ ReduceCost / RaiseCost static abilities — generic cost adjustment.
-    {
-        const Card* spellCard = m_game.findCard(cardId);
-        if (spellCard) {
-            int discount  = 0;
-            int surcharge = 0;
-
-            // Returns the integer amount for an Amount$/Cost$ param on a static ability.
-            // amountStr may be a digit string or an SVar name on srcCard.
-            auto resolveAmount = [&](std::string_view amountStr,
-                                     const Card* srcCard) -> int {
-                if (amountStr.empty()) return 1;
-                if (std::isdigit(static_cast<unsigned char>(amountStr[0]))) {
-                    int v = 0;
-                    std::from_chars(amountStr.data(),
-                                    amountStr.data() + amountStr.size(), v);
-                    return v;
-                }
-                // SVar reference
-                return m_game.evaluateSVar(std::string(amountStr),
-                                           srcCard->controllerId,
-                                           srcCard->rules, srcCard->id);
-            };
-
-            // Returns true when the IsPresent$ condition on a static ability is met.
-            auto checkIsPresent = [&](const ScriptLine& s, ObjectId srcId) -> bool {
-                auto isPresent = s.get("IsPresent", "");
-                if (isPresent.empty()) return true;
-                auto presentCmp = s.get("PresentCompare", "GE1");
-                int count = 0;
-                const Card* srcCard2 = m_game.findCard(srcId);
-                for (const Card* c2 : m_game.battlefield().cards())
-                    if (cardMatchesAnyFilter(*c2, std::string(isPresent),
-                                             controller, srcId, srcCard2, &m_game)) ++count;
-                if (presentCmp.size() < 3) return count >= 1;
-                auto op = presentCmp.substr(0, 2);
-                int n = 0;
-                std::from_chars(presentCmp.data() + 2,
-                                presentCmp.data() + presentCmp.size(), n);
-                if (op == "GE") return count >= n;
-                if (op == "LE") return count <= n;
-                if (op == "EQ") return count == n;
-                if (op == "GT") return count >  n;
-                if (op == "LT") return count <  n;
-                return false;
-            };
-
-            // Processes S: lines on srcCard for ReduceCost/RaiseCost.
-            // isSelf=true means the source is the spell card itself (EffectZone$ All applies).
-            auto processLines = [&](const std::vector<std::string>& lines,
-                                    const Card* srcCard, bool isSelf) {
-                for (const auto& raw : lines) {
-                    auto s = parseScriptLine(raw);
-                    auto mode = s.get("Mode", "");
-                    bool isReduce = (mode == "ReduceCost");
-                    bool isRaise  = (mode == "RaiseCost");
-                    if (!isReduce && !isRaise) continue;
-
-                    // EffectZone: source must be in the right zone.
-                    // Card.Self abilities on the spell use EffectZone$ All/Hand.
-                    auto ez = s.get("EffectZone", isSelf ? "All" : "Battlefield");
-                    if (ez != "All" && !(isSelf && (ez == "Hand" || ez == "Stack")))
-                        if (!srcCard->isOnBattlefield()) continue;
-
-                    // Activator$ You — caster must control the source.
-                    auto activator = s.get("Activator", "");
-                    if (!activator.empty() && activator == "You")
-                        if (srcCard->controllerId != controller) continue;
-
-                    // ValidCard — does the spell card match the filter?
-                    auto validCard = s.get("ValidCard", "");
-                    if (!validCard.empty()) {
-                        if (!cardMatchesAnyFilter(*spellCard, std::string(validCard),
-                                                   controller, srcCard->id, srcCard, &m_game))
-                            continue;
-                    }
-
-                    // IsPresent$ condition
-                    if (!checkIsPresent(s, srcCard->id)) continue;
-
-                    int amount = resolveAmount(
-                        isReduce ? s.get("Amount", "1") : s.get("Cost", "1"),
-                        srcCard);
-                    if (amount <= 0) continue;
-
-                    if (isReduce) discount  += amount;
-                    else          surcharge += amount;
-                }
-            };
-
-            // Process the spell's own static ability lines (may be in hand/stack).
-            processLines(rules->staticAbilityLines, spellCard, true);
-
-            // Process battlefield cards' static ability lines.
-            for (const Card* bf : m_game.battlefield().cards())
-                processLines(bf->rules->staticAbilityLines, bf, false);
-
-            ManaPool& pool = m_game.player(controller).manaPool();
-
-            // Apply discount: add free generic mana up to the generic portion of cost.
-            if (discount > 0) {
-                int toAdd = std::min(discount, usedCost.genericAmount());
-                if (toAdd > 0) pool.addGeneric(toAdd);
-            }
-            // Apply surcharge: pre-drain from pool (equivalent to cost increase).
-            if (surcharge > 0) {
-                int toDrain = std::min(surcharge, pool.total());
-                if (toDrain > 0) pool.addGeneric(-toDrain);
-            }
-        }
+    // S:Mode$ ReduceCost / RaiseCost static abilities — adjust the generic
+    // portion of the cost we actually pay. Apply it to the cost rather than
+    // padding the pool with free mana: padding overpaid (the player tapped the
+    // full cost out of habit and the extra floated away), and it never let an
+    // affordability check see the lower cost. genericReductionFor() is the same
+    // function the UI/AI gates use, so what's shown, checked, and paid agree.
+    ManaCost effectiveCost = usedCost;
+    if (const Card* spellCard = m_game.findCard(cardId)) {
+        int reduction = genericReductionFor(*spellCard, controller);
+        if (reduction != 0) effectiveCost = effectiveCost.reduceGeneric(reduction);
     }
 
     // Commander tax: +{2} generic mana per prior cast from the command zone.
@@ -922,15 +909,15 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
 
     // For X-cost spells, compute X = all mana left after paying the fixed colored cost.
     int xVal = 0;
-    if (usedCost.hasX()) {
+    if (effectiveCost.hasX()) {
         ManaPool& pool = m_game.player(controller).manaPool();
-        int fixedCmc  = usedCost.cmc();
+        int fixedCmc  = effectiveCost.cmc();
         int available = pool.total();
         if (available < fixedCmc) return false;
         xVal = available - fixedCmc;
     }
 
-    if (!payCost(usedCost, controller)) return false;
+    if (!payCost(effectiveCost, controller)) return false;
 
     // Pay the X portion (drain all remaining mana)
     if (xVal > 0) {

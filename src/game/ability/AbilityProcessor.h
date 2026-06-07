@@ -165,6 +165,14 @@ public:
     bool castSpell(ObjectId cardId, uint8_t controller,
                    const std::vector<Target>& targets = {});
 
+    // Net generic-mana cost reduction available to `controller` when casting
+    // `spell`, summed over all S:Mode$ ReduceCost / RaiseCost statics (the
+    // spell's own plus every battlefield permanent). Positive = cheaper.
+    // Shared by castSpell and the affordability gates (UI / AI) so a reduced
+    // spell is treated as affordable for its reduced cost — otherwise the
+    // reducer "did nothing" because the cost shown/checked was still full.
+    int genericReductionFor(const Card& spell, uint8_t controller) const;
+
     // ── Stack resolution ──────────────────────────────────────────────────
     // Resolve the top ability on the stack.
     void resolveTop();

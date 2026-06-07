@@ -14,6 +14,9 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <algorithm>
+#include <vector>
+#include <utility>
 #include <cassert>
 
 namespace mtg {
@@ -116,6 +119,7 @@ GameState GameState::clone() const {
     c.m_pendingTriggers         = m_pendingTriggers;
     c.m_pendingSearch           = m_pendingSearch;
     c.m_pendingRiot             = m_pendingRiot;
+    c.m_pendingChooseType       = m_pendingChooseType;
     c.m_pendingPayLife          = m_pendingPayLife;
     c.m_pendingFabricate        = m_pendingFabricate;
     c.m_pendingCharm            = m_pendingCharm;
@@ -481,6 +485,61 @@ static void applyETBReplacements(Card* ptr, uint8_t controllerId, GameState& gam
         }
     }
 
+    // K:ETBReplacement:Other — "As CARDNAME enters, choose a creature type"
+    // (Herald's Horn, etc.). Run the named SVar when it's a creature ChooseType:
+    // prompt the human with a focused list of types from their cards, or
+    // auto-pick the most prominent creature type for the AI. The result is
+    // stored on ptr->chosenType and read by the Creature.ChosenType filter.
+    if (!rules->etbOtherSVar.empty()) {
+        auto svIt = rules->svars.find(rules->etbOtherSVar);
+        if (svIt != rules->svars.end()) {
+            auto line = parseScriptLine(svIt->second);
+            if (line.effectType == "ChooseType" &&
+                line.get("Type", "Creature") == "Creature") {
+                // Tally creature subtypes across the controller's own cards so
+                // the choice list is short and relevant.
+                std::unordered_map<std::string,int> tally;
+                auto tallyCard = [&](const Card* cc) {
+                    if (!cc || !cc->rules || cc->isToken) return;
+                    if (!cc->rules->type.isCreature()) return;
+                    for (const auto& sub : cc->rules->type.subtypes) ++tally[sub];
+                };
+                const Player& pl = game.player(controllerId);
+                for (const Card* cc : pl.library().cards())   tallyCard(cc);
+                for (const Card* cc : pl.hand().cards())       tallyCard(cc);
+                for (const Card* cc : pl.graveyard().cards())  tallyCard(cc);
+                for (const Card* cc : game.battlefield().cards())
+                    if (cc && cc->controllerId == controllerId) tallyCard(cc);
+
+                // Sort candidate types by frequency (desc), then name.
+                std::vector<std::pair<std::string,int>> ranked(tally.begin(), tally.end());
+                std::sort(ranked.begin(), ranked.end(),
+                    [](const auto& a, const auto& b) {
+                        return a.second != b.second ? a.second > b.second : a.first < b.first;
+                    });
+
+                if (controllerId == 0 && game.isHumanInteractive()) {
+                    std::vector<std::string> opts;
+                    for (auto& r : ranked) { opts.push_back(r.first); if (opts.size() >= 12) break; }
+                    // Always offer a few staples so the player can pick even with
+                    // an empty/creatureless deck on the battlefield.
+                    for (const char* def : {"Human","Soldier","Goblin","Elf","Zombie","Dragon","Angel","Wizard"}) {
+                        if (opts.size() >= 12) break;
+                        if (std::find(opts.begin(), opts.end(), def) == opts.end())
+                            opts.emplace_back(def);
+                    }
+                    game.setPendingChooseType(ptr->id, std::move(opts));
+                } else {
+                    // AI: MostProminentInComputerDeckNonToken → top tallied type.
+                    if (!ranked.empty()) {
+                        ptr->chosenType      = ranked.front().first;
+                        game.chosenTypeName  = ranked.front().first;
+                    }
+                }
+            }
+        }
+    }
+
     // K:Fabricate N — put N +1/+1 counters on self, or create N 1/1 colorless Servo tokens.
     // Human player defers via pending UI; AI always takes counters (simpler evaluation).
     if (rules->hasFabricate && rules->fabricateAmount > 0) {
@@ -790,6 +849,11 @@ Card* GameState::createToken(const std::string& name,
         // {T}: Add one mana of any color
         rules.abilityLines.push_back(
             "AB$ Mana | Cost$ T | Produced$ Any | SpellDescription$ Add {C}.");
+    } else if (name == "Eldrazi Spawn" || name == "Eldrazi Scion") {
+        // Sacrifice this creature: Add {C}. (Forge encodes this as the "_sac"
+        // suffix on the c_0_1_eldrazi_spawn_sac / c_1_1_eldrazi_scion_sac script.)
+        rules.abilityLines.push_back(
+            "AB$ Mana | Cost$ Sac<Self> | Produced$ C | SpellDescription$ Sacrifice this creature: Add {C}.");
     }
     // ── Role tokens (Wilds of Eldraine enchantment auras) ─────────────────────
     // Role tokens are Aura Enchantments that grant bonuses to enchanted creatures.

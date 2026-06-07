@@ -70,6 +70,11 @@ struct CardRules {
     };
     std::optional<ETBCopyEntry> etbCopy;
 
+    // ETB "other" replacement: K:ETBReplacement:Other:SVar[:Optional].
+    // Holds the SVar name whose effect runs as the permanent enters — currently
+    // used for "As CARDNAME enters, choose a creature type" (Herald's Horn etc.).
+    std::string etbOtherSVar;
+
     // Vehicles: K:Crew:N
     bool hasCrew  = false;
     int  crewCost = 0; // minimum total power of creatures to tap

@@ -29,6 +29,14 @@ std::pair<std::string, int> parseCardLine(std::string_view line) {
         line = line.substr(0, pipe);
     line = trim(line);
 
+    // Forge/EDHREC exports mark some entries with a trailing '+' (alternate-art
+    // / preferred-printing marker, common on commander lines such as
+    // "Galea, Kindler of Hope+"). The card DB stores the bare name, so a '+'
+    // here makes the lookup miss — which silently dropped the commander. No MTG
+    // card name ends in '+', so strip any trailing '+' before extracting count.
+    while (!line.empty() && line.back() == '+') line.remove_suffix(1);
+    line = trim(line);
+
     // First token is count if it starts with a digit
     auto space = line.find(' ');
     if (space == std::string_view::npos) {

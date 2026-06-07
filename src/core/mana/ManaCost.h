@@ -27,6 +27,11 @@ public:
     // Bitmask of colors present in the cost (ManaAtom::COLORS_MASK bits)
     uint8_t colorIdentity() const noexcept;
 
+    // A copy with the generic portion reduced by `n` (clamped at 0). A negative
+    // `n` raises the generic cost instead (RaiseCost). Used to apply ReduceCost /
+    // RaiseCost static abilities to the cost actually paid and gated against.
+    ManaCost reduceGeneric(int n) const noexcept;
+
     // Returns "{3}{W}{W}", "{X}{R}", "{0}", or "" for no-cost
     std::string toString() const;
 

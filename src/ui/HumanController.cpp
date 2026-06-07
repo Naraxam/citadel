@@ -207,10 +207,14 @@ HumanController::availableModes() const {
 
     // Cast (always offered; cost depends on commander-zone, alternate-cost
     // selection happens inside castSpell — we surface the printed manaCost).
-    std::string castCost = c->rules->manaCost.toString();
+    // Apply any ReduceCost/RaiseCost statics so the cost shown and the
+    // affordability check match what castSpell will actually charge.
+    ManaCost castManaCost = c->rules->manaCost.reduceGeneric(
+        m_abilities.genericReductionFor(*c, 0));
+    std::string castCost = castManaCost.toString();
     if (castCost.empty()) castCost = "{0}";
     out.push_back({CastModeKind::Cast, "Cast", castCost,
-                   pool.canPay(c->rules->manaCost) || c->rules->manaCost.isNoCost()});
+                   pool.canPay(castManaCost) || castManaCost.isNoCost()});
 
     // Foretell (hand only, sorcery speed, not already foretold).
     if (c->rules->hasForetell && c->zone == ZoneType::Hand && !m_instantOnly) {

@@ -346,6 +346,7 @@ void BoardRenderer::drawInfoBar(sf::RenderTarget& t, uint8_t pid) const {
     // GY / Exile entries when they get drawn.
     m_gyIconRect[pid]    = {};
     m_exileIconRect[pid] = {};
+    m_libIconRect[pid]   = {};
 
     for (const auto& zi : zones) {
         std::string ns = std::to_string(zi.n);
@@ -394,6 +395,8 @@ void BoardRenderer::drawInfoBar(sf::RenderTarget& t, uint8_t pid) const {
             m_gyIconRect[pid]    = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
         else if (std::string_view(zi.key) == "EXILE")
             m_exileIconRect[pid] = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
+        else if (std::string_view(zi.key) == "LIBRARY")
+            m_libIconRect[pid]   = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
     }
 }
 
@@ -402,12 +405,15 @@ BoardRenderer::hitInfoBarZone(float px, float py) const noexcept {
     for (int pid = 0; pid < 2; ++pid) {
         if (m_gyIconRect[pid].width > 0.f &&
             m_gyIconRect[pid].contains(px, py))
-            return { pid, /*isExile=*/false };
+            return { pid, BrowseZone::Graveyard, true };
         if (m_exileIconRect[pid].width > 0.f &&
             m_exileIconRect[pid].contains(px, py))
-            return { pid, /*isExile=*/true };
+            return { pid, BrowseZone::Exile, true };
+        if (m_libIconRect[pid].width > 0.f &&
+            m_libIconRect[pid].contains(px, py))
+            return { pid, BrowseZone::Library, true };
     }
-    return { -1, false };
+    return { -1, BrowseZone::Graveyard, false };
 }
 
 int BoardRenderer::hitPlayerArea(float px, float py) const noexcept {
@@ -2523,34 +2529,44 @@ void BoardRenderer::drawZoneBrowserOverlay(sf::RenderTarget& t,
                                             const RenderHints& hints) const {
     if (!hints.showZoneBrowse || !m_game || !m_font) return;
 
-    const Zone* zone = nullptr;
-    if (hints.zoneBrowseIsExile) {
-        // Filter exile to cards owned by the browsed player
-        // (rendered inline below instead of using Zone directly)
-    } else {
-        zone = &m_game->player(hints.zoneBrowsePlayer).graveyard();
-    }
-
     if (hints.zoneBrowsePlayer >= 4) return;   // defensive: only valid seats
+
+    const BrowseZone bz = hints.zoneBrowseZone;
+    // Library is hidden information: only the viewing player (seat 0, the human)
+    // knows cards that have been revealed to them. Everything else shows a back.
+    const bool isLibrary = (bz == BrowseZone::Library);
 
     // Rebuild the list from the LIVE zones every frame. Caching raw Card*
     // across frames risked dangling pointers when a card left the zone while
     // the browser was open (the crash). The lists are tiny, so this is cheap.
     m_gyBrowserCache.clear();
-    if (hints.zoneBrowseIsExile) {
+    if (bz == BrowseZone::Exile) {
         for (const Card* c : m_game->exile().cards())
             if (c && c->rules && (c->ownerId & 1) == hints.zoneBrowsePlayer)
                 m_gyBrowserCache.push_back(c);
+    } else if (bz == BrowseZone::Library) {
+        for (const Card* c : m_game->player(hints.zoneBrowsePlayer).library().cards())
+            if (c && c->rules) m_gyBrowserCache.push_back(c);
     } else {
         for (const Card* c : m_game->player(hints.zoneBrowsePlayer).graveyard().cards())
             if (c && c->rules) m_gyBrowserCache.push_back(c);
     }
-    std::sort(m_gyBrowserCache.begin(), m_gyBrowserCache.end(),
-        [](const Card* a, const Card* b) { return a->zoneChangeSeq > b->zoneChangeSeq; });
+    // Graveyard/Exile are public piles → show newest on top. Library keeps its
+    // real order (front() is the top of the library) so positions are accurate.
+    if (!isLibrary)
+        std::sort(m_gyBrowserCache.begin(), m_gyBrowserCache.end(),
+            [](const Card* a, const Card* b) { return a->zoneChangeSeq > b->zoneChangeSeq; });
     m_gyBrowserCachedPlayer = hints.zoneBrowsePlayer;
-    m_gyBrowserCachedExile  = hints.zoneBrowseIsExile;
+    m_gyBrowserCachedZone   = bz;
     m_gyBrowserCacheDirty   = false;
     const std::vector<const Card*>& cards = m_gyBrowserCache;
+
+    // A library card is shown face-up only when it is known to the human viewer
+    // (revealed by a peek/scry/look effect). Public zones are always face-up.
+    auto cardKnown = [&](const Card* c) -> bool {
+        if (!isLibrary) return true;
+        return c->revealedToOwner && hints.zoneBrowsePlayer == 0;
+    };
 
     // Dim background
     sf::RectangleShape dim({WIN_W, WIN_H});
@@ -2567,7 +2583,9 @@ void BoardRenderer::drawZoneBrowserOverlay(sf::RenderTarget& t,
 
     // Header
     std::string playerName = (hints.zoneBrowsePlayer == 0) ? "Alice" : "Bob";
-    std::string zoneLabel  = hints.zoneBrowseIsExile ? "Exile" : "Graveyard";
+    std::string zoneLabel  = (bz == BrowseZone::Exile)   ? "Exile"
+                           : (bz == BrowseZone::Library) ? "Library (top first)"
+                                                         : "Graveyard";
     std::string title = playerName + "'s " + zoneLabel
                         + "  (" + std::to_string(cards.size()) + " cards)";
     drawTxt(t, *m_font, title, kBrowserPanX + 10.f, kBrowserPanY + 8.f, 13,
@@ -2593,6 +2611,29 @@ void BoardRenderer::drawZoneBrowserOverlay(sf::RenderTarget& t,
     for (int i = 0; i < shown; ++i) {
         const Card* c = cards[static_cast<size_t>(startIdx + i)];
         float iy = kBrowserStartY + i * (kBrowserItemH + kBrowserGap);
+
+        // Unknown card (hidden library card) → render a uniform card back row
+        // with just its position, never leaking the card's identity.
+        if (!cardKnown(c)) {
+            sf::RectangleShape back({kBrowserItemW, kBrowserItemH});
+            back.setPosition(kBrowserItemX, iy);
+            back.setFillColor(sf::Color(28, 30, 48));
+            back.setOutlineColor(sf::Color(70, 75, 110));
+            back.setOutlineThickness(1.f);
+            t.draw(back);
+            sf::RectangleShape thumb({36.f, kBrowserItemH - 4.f});
+            thumb.setPosition(kBrowserItemX + 3.f, iy + 2.f);
+            thumb.setFillColor(sf::Color(46, 50, 78));
+            thumb.setOutlineColor(sf::Color(90, 96, 140));
+            thumb.setOutlineThickness(1.f);
+            t.draw(thumb);
+            drawTxt(t, *m_font, "\x3F", kBrowserItemX + 17.f, iy + 9.f, 14,
+                    sf::Color(150, 156, 200), true);
+            std::string pos = "Hidden  (#" + std::to_string(startIdx + i + 1) + " from top)";
+            drawTxt(t, *m_font, pos, kBrowserItemX + 46.f, iy + 9.f, 10,
+                    sf::Color(150, 156, 195));
+            continue;
+        }
 
         uint8_t ci2 = c->rules->manaCost.colorIdentity();
         sf::Color bg2 = cardBackground(ci2, c->rules->type.isLand());
@@ -2701,24 +2742,35 @@ mtg::ObjectId BoardRenderer::hitZoneBrowserCard(float px, float py,
 
     // Mirror the draw exactly: same filter, same sort, same scroll offset —
     // otherwise a click maps to a different card than the one displayed.
+    const BrowseZone bz = hints.zoneBrowseZone;
+    const bool isLibrary = (bz == BrowseZone::Library);
     std::vector<const Card*> cards;
-    if (hints.zoneBrowseIsExile) {
+    if (bz == BrowseZone::Exile) {
         for (const Card* c : m_game->exile().cards())
             if (c && c->rules && (c->ownerId & 1) == hints.zoneBrowsePlayer) cards.push_back(c);
+    } else if (bz == BrowseZone::Library) {
+        for (const Card* c : m_game->player(hints.zoneBrowsePlayer).library().cards())
+            if (c && c->rules) cards.push_back(c);
     } else {
         for (const Card* c : m_game->player(hints.zoneBrowsePlayer).graveyard().cards())
             if (c && c->rules) cards.push_back(c);
     }
-    std::sort(cards.begin(), cards.end(),
-        [](const Card* a, const Card* b) { return a->zoneChangeSeq > b->zoneChangeSeq; });
+    if (!isLibrary)
+        std::sort(cards.begin(), cards.end(),
+            [](const Card* a, const Card* b) { return a->zoneChangeSeq > b->zoneChangeSeq; });
 
     int total = static_cast<int>(cards.size());
     int startIdx = std::clamp(m_gyBrowserScroll, 0, std::max(0, total - kBrowserMaxShow));
     int shown = std::min(kBrowserMaxShow, total - startIdx);
     for (int i = 0; i < shown; ++i) {
         float iy = kBrowserStartY + i * (kBrowserItemH + kBrowserGap);
-        if (py >= iy && py <= iy + kBrowserItemH)
-            return cards[static_cast<size_t>(startIdx + i)]->id;
+        if (py >= iy && py <= iy + kBrowserItemH) {
+            const Card* c = cards[static_cast<size_t>(startIdx + i)];
+            // Don't leak hidden library cards: only return known/public cards.
+            if (isLibrary && !(c->revealedToOwner && hints.zoneBrowsePlayer == 0))
+                return kInvalidId;
+            return c->id;
+        }
     }
     return kInvalidId;
 }

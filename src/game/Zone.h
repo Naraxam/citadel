@@ -54,6 +54,9 @@ public:
     // Shuffle the zone in place (library use).
     void shuffle(std::mt19937& rng) {
         std::shuffle(m_cards.begin(), m_cards.end(), rng);
+        // Shuffling hides the order again: any cards that were "known on top"
+        // (from a scry/peek) are no longer known to their owner.
+        for (Card* c : m_cards) if (c) c->revealedToOwner = false;
     }
 
     // ── Query ─────────────────────────────────────────────────────────────

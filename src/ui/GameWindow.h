@@ -164,6 +164,11 @@ private:
     struct ManaChoiceHit { sf::FloatRect rect; char color; };
     std::vector<ManaChoiceHit> m_manaChoiceHits;
 
+    // "Choose a creature type" overlay (Herald's Horn ETB) — one button rect per
+    // candidate type; the click handler calls completeChooseType(type).
+    struct ChooseTypeHit { sf::FloatRect rect; std::string type; };
+    std::vector<ChooseTypeHit> m_chooseTypeHits;
+
     // Multi-mana-ability picker (Shivan Reef, Temple of Malady…) button rects.
     // Each entry carries the AB$ Mana line index it represents.
     struct ManaAbilityHit { sf::FloatRect rect; int abilityIndex; };
@@ -175,6 +180,7 @@ private:
     sf::FloatRect m_scryBottomRect{};
 
     void completeManaChoice(char color);
+    void completeChooseType(const std::string& type);
     void completeScryChoice(bool keepTop);
 
     // ESC pause menu (in-game only) — replaces the old bottom-dock buttons.
@@ -281,9 +287,9 @@ private:
     void renderCollectionStats();
 
     // Zone browser overlay state
-    bool    m_zoneBrowseActive  = false;
-    uint8_t m_zoneBrowsePlayer  = 0;
-    bool    m_zoneBrowseIsExile = false;
+    bool       m_zoneBrowseActive = false;
+    uint8_t    m_zoneBrowsePlayer  = 0;
+    ui::BrowseZone m_zoneBrowseZone = ui::BrowseZone::Graveyard;
 
     // Undo: ring buffer of up to 5 game state snapshots (Ctrl+Z to restore)
     static constexpr int kUndoDepth = 5;
@@ -340,6 +346,11 @@ private:
     void         render();
     void         toggleFullscreen();
     void         updateView();
+    // Draw an sf::Text with hi-DPI sharpening (rasterize glyphs at the current
+    // viewport scale so overlay/HUD text stays crisp when the window is
+    // maximized). Restores the text's size/scale afterwards so callers can
+    // reuse the object. No-op at 1x.
+    void         drawText(sf::Text& t);
     sf::Vector2f mapMousePos(int x, int y) const;
     sf::Event    remapEvent(const sf::Event& ev) const;
 

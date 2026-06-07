@@ -23,6 +23,16 @@ struct PendingRiotChoice {
     ObjectId cardId = kInvalidId;
 };
 
+// "As CARDNAME enters, choose a creature type" (Herald's Horn) — pending for the
+// human player. `options` is a focused, clickable list of candidate creature
+// types (those present across the player's zones); picking one stores it on the
+// card's chosenType.
+struct PendingChooseTypeChoice {
+    bool                     active = false;
+    ObjectId                 cardId = kInvalidId;
+    std::vector<std::string> options;
+};
+
 // "Pay N life or it enters tapped" (shock lands) — pending for the human player.
 // On accept: pay `amount` life. On decline: tap `cardId`.
 struct PendingPayLifeChoice {
@@ -658,6 +668,14 @@ public:
     void setPendingRiot(ObjectId id) noexcept   { m_pendingRiot = {true, id}; }
     void clearPendingRiot()      noexcept       { m_pendingRiot = {}; }
 
+    // ChooseType: ETB "choose a creature type" pending for the human player.
+    bool     hasPendingChooseType() const noexcept { return m_pendingChooseType.active; }
+    const PendingChooseTypeChoice& pendingChooseType() const noexcept { return m_pendingChooseType; }
+    void setPendingChooseType(ObjectId id, std::vector<std::string> opts) {
+        m_pendingChooseType = {true, id, std::move(opts)};
+    }
+    void clearPendingChooseType() noexcept { m_pendingChooseType = {}; }
+
     // "Pay N life or enters tapped" (shock lands): ETB choice pending for human.
     bool     hasPendingPayLife()    const noexcept { return m_pendingPayLife.active; }
     ObjectId pendingPayLifeCardId() const noexcept { return m_pendingPayLife.cardId; }
@@ -765,6 +783,7 @@ private:
     PendingMadnessCast     m_pendingMadnessCast;
     PendingLibrarySearch m_pendingSearch;
     PendingRiotChoice      m_pendingRiot;
+    PendingChooseTypeChoice m_pendingChooseType;
     PendingPayLifeChoice   m_pendingPayLife;
     PendingFabricateChoice m_pendingFabricate;
     PendingCharmChoice     m_pendingCharm;

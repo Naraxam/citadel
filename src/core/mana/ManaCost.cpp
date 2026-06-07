@@ -85,6 +85,14 @@ int ManaCost::cmc() const noexcept {
     return total;
 }
 
+ManaCost ManaCost::reduceGeneric(int n) const noexcept {
+    ManaCost out = *this;
+    if (out.m_noCost) return out;
+    out.m_generic = out.m_generic - n;
+    if (out.m_generic < 0) out.m_generic = 0;
+    return out;
+}
+
 uint8_t ManaCost::colorIdentity() const noexcept {
     uint8_t mask = 0;
     for (const auto& s : m_shards)

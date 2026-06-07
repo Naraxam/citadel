@@ -13,6 +13,9 @@ namespace mtg { class AbilityProcessor; }
 
 namespace ui {
 
+// Which hidden/visible zone the zone-browser overlay is showing.
+enum class BrowseZone : uint8_t { Graveyard = 0, Exile = 1, Library = 2 };
+
 // Describes the current interactive state so BoardRenderer can apply
 // highlights and messages without knowing game logic.
 struct RenderHints {
@@ -44,10 +47,10 @@ struct RenderHints {
     // Card collection counts (name → times seen) — supplied by GameWindow
     const std::unordered_map<std::string, int>* cardCollection = nullptr;
 
-    // Zone browser overlay — show all cards in a player's GY or Exile
-    bool    showZoneBrowse      = false;
-    uint8_t zoneBrowsePlayer    = 0;    // 0 = Alice, 1 = Bob
-    bool    zoneBrowseIsExile   = false;
+    // Zone browser overlay — show all cards in a player's GY, Exile or Library
+    bool       showZoneBrowse   = false;
+    uint8_t    zoneBrowsePlayer = 0;    // 0 = Alice, 1 = Bob
+    BrowseZone zoneBrowseZone   = BrowseZone::Graveyard;
 
     // When true: replace all color-coded tints with shape/pattern overlays
     // so the display is accessible to colour-blind players.
@@ -142,7 +145,7 @@ public:
     // Returns the (player, isExile) pair to open in the zone browser, or
     // (-1, false) on miss. Hit rects are captured during drawInfoBar so
     // callers get pixel-accurate hits matching the rendered icons.
-    struct ZoneIconHit { int player; bool isExile; };
+    struct ZoneIconHit { int player; BrowseZone zone; bool valid = true; };
     ZoneIconHit hitInfoBarZone(float px, float py) const noexcept;
     // Player info-bar click (life/name area, excluding the GY/Exile zone icons).
     // Returns 0 (you) / 1 (opponent), or -1. Used to target players with spells.
@@ -247,6 +250,7 @@ public:
     // Indexed by player (0 = Alice, 1 = Bob).
     mutable sf::FloatRect m_gyIconRect[2];
     mutable sf::FloatRect m_exileIconRect[2];
+    mutable sf::FloatRect m_libIconRect[2];
 
     // Zone browser scroll offset (number of rows scrolled down).
     // Mutable so hitTest and draw can use it while const.
@@ -255,8 +259,8 @@ public:
     // Zone browser card list cache — rebuilt only when player/zone/exile selection changes
     mutable std::vector<const mtg::Card*> m_gyBrowserCache;
     mutable bool    m_gyBrowserCacheDirty = true;
-    mutable uint8_t m_gyBrowserCachedPlayer = 255;
-    mutable bool    m_gyBrowserCachedExile  = false;
+    mutable uint8_t    m_gyBrowserCachedPlayer = 255;
+    mutable BrowseZone m_gyBrowserCachedZone   = BrowseZone::Graveyard;
 
     // Scroll the zone browser overlay (positive = down, negative = up).
     // Returns true if the event was consumed (browser is open).
