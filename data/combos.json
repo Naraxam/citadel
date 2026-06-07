@@ -1,0 +1,164 @@
+[
+  {
+    "id": "curiosity_niv_firemind",
+    "description": "Attach Curiosity to Niv-Mizzet for unlimited draw/damage",
+    "required": ["Curiosity", "Niv-Mizzet, the Firemind"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Curiosity", "target_card": "Niv-Mizzet, the Firemind" }
+    ]
+  },
+  {
+    "id": "curiosity_niv_parun",
+    "description": "Attach Curiosity to Niv-Mizzet, Parun for draw/damage loop",
+    "required": ["Curiosity", "Niv-Mizzet, Parun"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Curiosity", "target_card": "Niv-Mizzet, Parun" }
+    ]
+  },
+  {
+    "id": "keen_sense_niv",
+    "description": "Attach Keen Sense to Niv-Mizzet for draw triggers",
+    "required": ["Keen Sense", "Niv-Mizzet, the Firemind"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Keen Sense", "target_card": "Niv-Mizzet, the Firemind" }
+    ]
+  },
+  {
+    "id": "pariah_indestructible",
+    "description": "Enchant own indestructible creature with Pariah to redirect all damage",
+    "required": ["Pariah"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "cast", "card": "Pariah", "target_filter": "Creature.YouCtrl+Indestructible" }
+    ]
+  },
+  {
+    "id": "pestilence_activate",
+    "description": "Activate Pestilence to clear the board when ahead in life",
+    "required": ["Pestilence"],
+    "condition": "own_life >= 8",
+    "sequence": [
+      { "type": "activate", "card": "Pestilence", "ability_index": 0 }
+    ]
+  },
+  {
+    "id": "goblin_bombardment_sacrifice",
+    "description": "Sacrifice weakest creature to Goblin Bombardment for reach damage",
+    "required": ["Goblin Bombardment"],
+    "condition": "own_creatures >= 2",
+    "sequence": [
+      { "type": "activate", "card": "Goblin Bombardment", "ability_index": 0 }
+    ]
+  },
+  {
+    "id": "isochron_scepter_activate",
+    "description": "Activate Isochron Scepter to cast imprinted instant",
+    "required": ["Isochron Scepter"],
+    "condition": "",
+    "sequence": [
+      { "type": "activate", "card": "Isochron Scepter", "ability_index": 0 }
+    ]
+  },
+  {
+    "id": "sword_fire_ice_equip",
+    "description": "Equip Sword of Fire and Ice to best attacker",
+    "required": ["Sword of Fire and Ice"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "equip", "card": "Sword of Fire and Ice" }
+    ]
+  },
+  {
+    "id": "sword_feast_famine_equip",
+    "description": "Equip Sword of Feast and Famine to untap lands on attack",
+    "required": ["Sword of Feast and Famine"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "equip", "card": "Sword of Feast and Famine" }
+    ]
+  },
+  {
+    "id": "sword_light_shadow_equip",
+    "description": "Equip Sword of Light and Shadow for protection and recursion",
+    "required": ["Sword of Light and Shadow"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "equip", "card": "Sword of Light and Shadow" }
+    ]
+  },
+  {
+    "id": "jitte_equip",
+    "description": "Equip Umezawa's Jitte to best attacker for counters",
+    "required": ["Umezawa's Jitte"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "equip", "card": "Umezawa's Jitte" }
+    ]
+  },
+  {
+    "id": "sigil_of_sleep_pinger",
+    "description": "Attach Sigil of Sleep to own tap-to-deal-damage creature for bounce engine",
+    "required": ["Sigil of Sleep", "Niv-Mizzet, the Firemind"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Sigil of Sleep", "target_card": "Niv-Mizzet, the Firemind" }
+    ]
+  },
+  {
+    "id": "grafted_exoskeleton_equip",
+    "description": "Equip Grafted Exoskeleton for infect win",
+    "required": ["Grafted Exoskeleton"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "equip", "card": "Grafted Exoskeleton" }
+    ]
+  },
+  {
+    "id": "splinter_twin_pestermite",
+    "description": "Cast Splinter Twin on Pestermite for infinite token combo",
+    "required": ["Splinter Twin", "Pestermite"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Splinter Twin", "target_card": "Pestermite" }
+    ]
+  },
+  {
+    "id": "splinter_twin_deceiver",
+    "description": "Cast Splinter Twin on Deceiver Exarch for infinite token combo",
+    "required": ["Splinter Twin", "Deceiver Exarch"],
+    "condition": "",
+    "sequence": [
+      { "type": "cast", "card": "Splinter Twin", "target_card": "Deceiver Exarch" }
+    ]
+  },
+  {
+    "id": "kiki_jiki_cloud_of_faeries",
+    "description": "Activate Kiki-Jiki targeting Cloud of Faeries for infinite mana",
+    "required": ["Kiki-Jiki, Mirror Breaker", "Cloud of Faeries"],
+    "condition": "",
+    "sequence": [
+      { "type": "activate", "card": "Kiki-Jiki, Mirror Breaker", "ability_index": 0 }
+    ]
+  },
+  {
+    "id": "animate_dead_priority",
+    "description": "Cast Animate Dead when opponent has a powerful creature in graveyard",
+    "required": ["Animate Dead"],
+    "condition": "opp_creatures >= 1",
+    "sequence": [
+      { "type": "cast", "card": "Animate Dead", "target_filter": "Creature.Graveyard" }
+    ]
+  },
+  {
+    "id": "ethereal_armor_aura_count",
+    "description": "Cast Ethereal Armor when multiple enchantments are in play",
+    "required": ["Ethereal Armor"],
+    "condition": "own_creatures >= 1",
+    "sequence": [
+      { "type": "cast", "card": "Ethereal Armor", "target_filter": "Creature.YouCtrl" }
+    ]
+  }
+]
