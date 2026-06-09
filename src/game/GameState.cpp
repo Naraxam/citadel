@@ -96,15 +96,29 @@ GameState GameState::clone() const {
     c.triggerAmountHint                     = triggerAmountHint;
     c.cantGainLife[0]                       = cantGainLife[0];
     c.cantGainLife[1]                       = cantGainLife[1];
+    c.tempCantGainLife[0]                   = tempCantGainLife[0];
+    c.tempCantGainLife[1]                   = tempCantGainLife[1];
+    c.tempCantActivate[0]                   = tempCantActivate[0];
+    c.tempCantActivate[1]                   = tempCantActivate[1];
     c.commanderCastCount[0]                 = commanderCastCount[0];
     c.commanderCastCount[1]                 = commanderCastCount[1];
     c.cantPlayLand[0]                       = cantPlayLand[0];
     c.cantPlayLand[1]                       = cantPlayLand[1];
     for (int i = 0; i < 4; ++i) c.extraLandPlays[i] = extraLandPlays[i];
+    c.tempExtraLandPlays[0] = tempExtraLandPlays[0];
+    c.tempExtraLandPlays[1] = tempExtraLandPlays[1];
+    c.tempMaxHandSize[0]    = tempMaxHandSize[0];
+    c.tempMaxHandSize[1]    = tempMaxHandSize[1];
     c.chosenPlayerHint                      = chosenPlayerHint;
     c.monarchPlayer                         = monarchPlayer;
     c.chosenTypeName                        = chosenTypeName;
     c.chosenColorName                       = chosenColorName;
+    c.turnControllerOf[0]                    = turnControllerOf[0];
+    c.turnControllerOf[1]                    = turnControllerOf[1];
+    c.tempCantCast                           = tempCantCast;
+    c.tempCostMods                           = tempCostMods;
+    c.pendingRetarget                       = pendingRetarget;
+    c.pendingControlChange                  = pendingControlChange;
     c.dynamicSVars                          = dynamicSVars;
     c.permanentLeftBattlefieldThisTurn[0]   = permanentLeftBattlefieldThisTurn[0];
     c.permanentLeftBattlefieldThisTurn[1]   = permanentLeftBattlefieldThisTurn[1];
@@ -2307,6 +2321,11 @@ void GameState::recomputeStaticBonuses() {
 
     // Apply Rule 613 layer-ordered effects from m_continuousEffects.
     LayerEngine::apply(*this);
+
+    // Re-apply "loses keyword until end of turn" (Debuff) last, so a keyword the
+    // creature would otherwise regain from a continuous grant stays removed.
+    for (Card* c : m_battlefield.cards())
+        if (c->tempRemovedKeywords) c->keywordMask &= ~c->tempRemovedKeywords;
 }
 
 bool GameState::hasFlashGrant(const Card& c) const noexcept {

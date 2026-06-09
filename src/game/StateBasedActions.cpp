@@ -112,7 +112,7 @@ bool StateBasedActions::checkCreatureDeath(GameState& game) {
         // Regeneration shield absorbs one lethal-damage event
         bool wouldDie = (card->markedDamage >= toughness) ||
                         (card->deathtouchDamage && card->markedDamage > 0);
-        if (wouldDie && card->counterCount("regen") > 0) {
+        if (wouldDie && card->counterCount("regen") > 0 && !card->tempCantRegenerate) {
             // Pop the regen shield: tap the creature, clear damage
             const_cast<Card*>(card)->removeCounter("regen");
             const_cast<Card*>(card)->markedDamage     = 0;

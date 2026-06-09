@@ -11,6 +11,13 @@ bool executeEffect(const ScriptLine& script, EffectContext& ctx);
 // Execute script and follow any SubAbility$ chain through the source card's SVars.
 void executeEffectChain(const ScriptLine& script, EffectContext& ctx);
 
+// Apply R:Event$ DamageDone prevention replacements to a damage amount before it is
+// dealt. targetCard XOR a player (targetPlayerId, -1 if the target is a card).
+// Returns the (possibly reduced) amount. Used by both spell and combat damage.
+int applyDamageReplacements(int amount, const Card* sourceCard,
+                            const Card* targetCard, int targetPlayerId,
+                            const GameState& game);
+
 // ── Individual handlers (public so tests can call them directly) ──────────────
 
 void effectDealDamage   (const ScriptLine& s, EffectContext& ctx);
@@ -89,6 +96,22 @@ void effectMultiplyCounter  (const ScriptLine& s, EffectContext& ctx); // double
 void effectMoveCounter      (const ScriptLine& s, EffectContext& ctx); // move counters between cards
 void effectUnattach         (const ScriptLine& s, EffectContext& ctx); // detach equipment
 void effectProtect          (const ScriptLine& s, EffectContext& ctx); // grant protection from color
+void effectDebuff           (const ScriptLine& s, EffectContext& ctx); // target loses keyword(s) until EOT
+void effectTapOrUntap       (const ScriptLine& s, EffectContext& ctx); // tap or untap target permanent(s)
+void effectClash            (const ScriptLine& s, EffectContext& ctx); // clash with an opponent
+void effectEachDamage       (const ScriptLine& s, EffectContext& ctx); // each damager deals damage to targets
+void effectRemoveCounterAll (const ScriptLine& s, EffectContext& ctx); // remove counters from all matching
+void effectBecomesBlocked   (const ScriptLine& s, EffectContext& ctx); // attacking creature becomes blocked
+void effectAddOrRemoveCounter(const ScriptLine& s, EffectContext& ctx); // add or remove a counter
+void effectExchangePower     (const ScriptLine& s, EffectContext& ctx); // swap two creatures' base power
+void effectExchangeLifeVariant(const ScriptLine& s, EffectContext& ctx); // swap life with creature power
+void effectDrainMana         (const ScriptLine& s, EffectContext& ctx); // empty target's mana pool to you
+void effectManaReflected     (const ScriptLine& s, EffectContext& ctx); // reflect produced mana (TapsForMana)
+void effectChangeTargets     (const ScriptLine& s, EffectContext& ctx); // redirect a spell on the stack
+void effectControlSpell      (const ScriptLine& s, EffectContext& ctx); // gain control of a stack spell
+void effectGainControlVariant(const ScriptLine& s, EffectContext& ctx); // mass control change (to owner/swap/random)
+void effectChangeCombatants  (const ScriptLine& s, EffectContext& ctx); // make a creature attack / reselect defender
+void effectControlPlayer     (const ScriptLine& s, EffectContext& ctx); // control a player's next turn (deny it)
 void effectAnimateAll       (const ScriptLine& s, EffectContext& ctx); // mass animate permanents
 void effectBalance          (const ScriptLine& s, EffectContext& ctx); // sacrifice to minimum count
 void effectPhasing          (const ScriptLine& s, EffectContext& ctx); // phase out a permanent
@@ -106,7 +129,6 @@ void effectDestroyAll       (const ScriptLine& s, EffectContext& ctx); // destro
 void effectAlterAttribute   (const ScriptLine& s, EffectContext& ctx); // set/clear game-mechanic attributes
 void effectMakeCard         (const ScriptLine& s, EffectContext& ctx); // conjure/create a named card
 void effectPeekAndReveal    (const ScriptLine& s, EffectContext& ctx); // peek at library top, reveal matching
-void effectPopulate         (const ScriptLine& s, EffectContext& ctx); // copy creature token
 void effectCopySpell        (const ScriptLine& s, EffectContext& ctx); // copy a spell on the stack
 void effectAddPhase         (const ScriptLine& s, EffectContext& ctx); // add extra phase
 void effectMustBlock        (const ScriptLine& s, EffectContext& ctx); // force block

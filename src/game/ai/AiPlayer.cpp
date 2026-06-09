@@ -153,6 +153,7 @@ bool AiPlayer::takeTurn(TurnManager& tm, AiPlayer* defender) {
         tryActivateCompanion();   // bring companion to hand for {3} when affordable
         tryForetell();
         trySuspend();
+        for (int i = 0; i < 8 && tryPlayImpulseFromExile(); ++i) {}
         phaseLog("main1-cast");
         {
             int castIter = 0;
@@ -347,6 +348,7 @@ bool AiPlayer::takeTurn(TurnManager& tm, AiPlayer* defender) {
         m_abilities.drainPendingTriggers();
         tryForetell();
         trySuspend();
+        for (int i = 0; i < 8 && tryPlayImpulseFromExile(); ++i) {}
     }
     tm.endStep();
     if (tm.isGameOver()) return true;
@@ -1201,6 +1203,8 @@ bool AiPlayer::tryActivateCompanion() {
 }
 
 bool AiPlayer::tryPlayLand() {
+    // ControlPlayer: a controlled player takes no voluntary actions this turn.
+    if (m_game.isTurnControlled(m_id)) return false;
     if (!m_game.canPlayLand(m_id)) return false;   // respects extra land plays
 
     // Compute which colors we need most from the hand's spells
@@ -1529,6 +1533,8 @@ int AiPlayer::rateSpell(const Card& card) const {
 }
 
 bool AiPlayer::tryCastBestSpell() {
+    // ControlPlayer: a controlled player takes no voluntary actions this turn.
+    if (m_game.isTurnControlled(m_id)) return false;
     // â”€â”€ MCTS spell sequencing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     if (m_mctsEnabled) {
         std::vector<float>* dist = nullptr;
@@ -2008,6 +2014,8 @@ void AiPlayer::tryActivatePlaneswalkers() {
 }
 
 bool AiPlayer::tryActivateAbilities() {
+    // ControlPlayer: a controlled player takes no voluntary actions this turn.
+    if (m_game.isTurnControlled(m_id)) return false;
     // Activate non-mana, non-planeswalker abilities for all controlled battlefield cards.
     // Iterates once (no loop) to avoid cascading effects mid-phase.
     // Snapshot IDs first: payActivationCost may sacrifice a card and call moveToZone,
@@ -2357,6 +2365,8 @@ bool AiPlayer::shouldAttack(const Card& attacker) const {
 
 
 void AiPlayer::doAttackers(TurnManager& tm) {
+    // ControlPlayer: a controlled player declares no attackers (denies them the turn).
+    if (m_game.isTurnControlled(m_id)) return;
     // MCTS path: let MctsSearch select the attacker subset
     if (m_mctsEnabled) {
         std::vector<float>* dist = nullptr;
@@ -2528,6 +2538,13 @@ void AiPlayer::declareBlockers(TurnManager& tm) {
         if (tm.combatState().isBlocking(c->id)) continue;
         if (tm.combatState().isAttacking(c->mustBlockTarget))
             tm.declareBlocker(c->id, c->mustBlockTarget);
+    }
+    // MustBlock "if able" (any attacker) — block the first attacker it legally can.
+    for (Card* c : m_game.battlefield().cards()) {
+        if (c->controllerId != m_id || !c->isCreature() || c->tapped) continue;
+        if (!c->mustBlockAny || tm.combatState().isBlocking(c->id)) continue;
+        for (const auto& a : tm.combatState().attacks)
+            if (tm.declareBlocker(c->id, a.attackerId)) break;
     }
 
     // Planeswalker defense: block attackers heading for our planeswalkers
@@ -2913,6 +2930,41 @@ bool AiPlayer::tryForetell() {
         auto tgts = pickTargets(*c->rules);
         if (m_abilities.castSpell(c->id, m_id, tgts)) {
             AIOUT << "  [" << me().name() << "] casts foretold " << srcName << '\n';
+            return true;
+        }
+    }
+    return false;
+}
+
+// Impulse draw: play cards exiled with "you may play those cards until end of [next]
+// turn" (Light Up the Stage, Reckless Impulse). Lands are played as a land drop;
+// nonland cards are cast paying their mana cost.
+bool AiPlayer::tryPlayImpulseFromExile() {
+    if (m_game.isTurnControlled(m_id)) return false;   // controlled player takes no actions
+    for (Card* c : m_game.exile().cards()) {
+        if (!c->mayPlayFromExile || c->mayPlayController != m_id) continue;
+        if (m_game.turnNumber() > c->mayPlayUntilTurn) continue;
+
+        if (c->rules->type.isLand()) {
+            if (!m_game.canPlayLand(m_id)) continue;
+            const std::string nm = c->rules->name;
+            Card* landed = m_game.moveToZone(c->id, ZoneType::Battlefield, m_id);
+            me().incLandsPlayed();
+            AIOUT << "  [" << me().name() << "] plays exiled land " << nm << '\n';
+            if (landed) {
+                std::vector<PendingTrigger> t;
+                TriggerSystem::onLandPlayed(*landed, m_id, m_game, t);
+                m_game.queueTriggers(std::move(t));
+            }
+            return true;
+        }
+
+        if (!canAffordWithUntapped(c->rules->manaCost)) continue;
+        tapForCost(c->rules->manaCost.cmc());
+        const std::string nm = c->rules->name;
+        auto tgts = pickTargets(*c->rules);
+        if (m_abilities.castSpell(c->id, m_id, tgts)) {
+            AIOUT << "  [" << me().name() << "] plays exiled " << nm << '\n';
             return true;
         }
     }

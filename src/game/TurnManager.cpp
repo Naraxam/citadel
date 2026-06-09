@@ -4,6 +4,7 @@
 #include "CardStats.h"
 #include "TriggerSystem.h"
 #include "KeywordAbility.h"
+#include "ability/Effects.h"
 #include <algorithm>
 #include <charconv>
 #include <memory>
@@ -90,8 +91,21 @@ void TurnManager::beginStep() {
         break;
 
     case TurnStep::Cleanup: {
+        // ControlPlayer lasts exactly the controlled player's turn — release it here.
+        m_game.clearTurnController(ap);
+        m_game.tempCantCast.clear();  // "can't cast this turn" restrictions wear off
+        m_game.tempCostMods.clear();  // "spells cost less this turn" reductions wear off
+        m_game.tempCantActivate[0] = false;  // "can't activate abilities this turn" wears off
+        m_game.tempCantActivate[1] = false;
+        m_game.tempCantGainLife[0] = false;  // "can't gain life this turn" wears off
+        m_game.tempCantGainLife[1] = false;
+        m_game.tempExtraLandPlays[0] = 0;    // extra land plays this turn wear off
+        m_game.tempExtraLandPlays[1] = 0;
         Player& p = m_game.player(ap);
-        while (static_cast<int>(p.hand().size()) > p.maxHandSize()) {
+        int maxHand = (ap < 2 && m_game.tempMaxHandSize[ap] >= 0)
+                      ? m_game.tempMaxHandSize[ap] : p.maxHandSize();
+        if (ap < 2) { m_game.tempMaxHandSize[0] = -1; m_game.tempMaxHandSize[1] = -1; }
+        while (static_cast<int>(p.hand().size()) > maxHand) {
             Card* last = p.hand().back();
             if (!last) break;
             m_game.moveToZone(last->id, ZoneType::Graveyard, ap);
@@ -107,7 +121,14 @@ void TurnManager::beginStep() {
             c->enlistBonus    = 0;
             c->keywordMask   &= ~c->tempKeywords;
             c->tempKeywords   = 0;
+            c->keywordMask        |= c->tempRemovedKeywords;  // Debuff wears off
+            c->tempRemovedKeywords = 0;
             c->tempIsCreature = false;
+            c->tempUnblockable = false;   // "can't be blocked this turn" wears off
+            c->tempBlockOnlyBy.clear();
+            c->tempCantBlock = false;     // "can't block this turn" wears off
+            c->tempCantAttack = false;    // "can't attack this turn" wears off
+            c->tempCantRegenerate = false;// "can't be regenerated this turn" wears off
             // Detain (cantAttack/cantBlock) wears off at the detaining player's
             // next turn — simplification: clear at end of any turn
             c->cantAttack        = false;
@@ -117,6 +138,8 @@ void TurnManager::beginStep() {
             c->mustAttack        = false;
             c->mustAttackTarget  = 255;
             c->mustBlockTarget   = kInvalidId;
+            c->mustBlockAny      = false;
+            c->tempCantActivate  = false;
         }
         // Revert GainControl Duration$ EndOfTurn effects
         for (Card* c : m_game.battlefield().cards()) {
@@ -418,7 +441,7 @@ bool TurnManager::declareAttacker(ObjectId creatureId, uint8_t defendingPlayerId
     if (c->tapped)                                             return false;
     if (c->summoningSickness)                                  return false;
     if (c->controllerId != m_game.activePlayerId())            return false;
-    if (c->cantAttack)                                         return false;
+    if (c->cantAttack || c->tempCantAttack)                    return false;
     // Goad: can't attack the player who goaded it
     if (c->goaded && c->goadedBy == defendingPlayerId)         return false;
 
@@ -514,7 +537,7 @@ bool TurnManager::declareBlocker(ObjectId blockerId, ObjectId attackerId) {
     if (!blocker->isCreature())                                return false;
     if (!blocker->isOnBattlefield())                           return false;
     if (blocker->tapped)                                       return false;
-    if (blocker->cantBlock)                                    return false;
+    if (blocker->cantBlock || blocker->tempCantBlock)          return false;
     if (blocker->controllerId == m_game.activePlayerId())      return false;
 
     auto* attack = m_combat.findAttack(attackerId);
@@ -527,10 +550,11 @@ bool TurnManager::declareBlocker(ObjectId blockerId, ObjectId attackerId) {
     if ((int)attack->blockerIds.size() >= attacker->maxBlockerCount) return false;
 
     // CantBlockBy: attacker is unblockable or can only be blocked by a filter
-    if (attacker->unblockable) return false;
-    if (!attacker->blockOnlyBy.empty()) {
-        if (!cardMatchesAnyFilter(*blocker, attacker->blockOnlyBy,
-                                  blocker->controllerId, attacker->id))
+    // (permanent statics, plus DB$ Effect "can't be blocked this turn").
+    if (attacker->unblockable || attacker->tempUnblockable) return false;
+    for (const std::string* filt : { &attacker->blockOnlyBy, &attacker->tempBlockOnlyBy }) {
+        if (!filt->empty() &&
+            !cardMatchesAnyFilter(*blocker, *filt, blocker->controllerId, attacker->id))
             return false;
     }
 
@@ -654,10 +678,15 @@ bool TurnManager::hasFirstStrikers() const noexcept {
 // Helper: deal damage to a creature, respecting deathtouch / infect / wither / protection.
 // sourceColor: ManaAtom color bitmask of the damage source (0 = colorless).
 static void applyDamageToCreature(Card& target, int amount, bool fromDeathtouch,
-                                   bool fromInfect = false, bool fromWither = false,
-                                   uint8_t sourceColor = 0) {
+                                   bool fromInfect, bool fromWither,
+                                   uint8_t sourceColor,
+                                   GameState& game, const Card* source) {
     // Protection prevents damage from sources of the matching color
     if (hasProtectionFrom(target.keywordMask, sourceColor)) return;
+
+    // R:Event$ DamageDone prevention replacements (Daunting Defender, Cover of Winter…)
+    amount = applyDamageReplacements(amount, source, &target, -1, game);
+    if (amount <= 0) return;
 
     // Per-card damage prevention shield
     if (target.damageShield > 0) {
@@ -745,8 +774,11 @@ void TurnManager::dealCombatDamage(bool isFirstStrikeStep) {
                     continue;  // skip normal player-damage code
                 }
 
-                // Per-player damage prevention shield
-                int damToPlayer = power;
+                // R:Event$ DamageDone prevention to the player (Guardian Seraph…),
+                // then the per-player damage prevention shield.
+                int damToPlayer = applyDamageReplacements(
+                    power, attacker, nullptr,
+                    static_cast<int>(attack.defendingPlayerId), m_game);
                 {
                     Player& defender = m_game.player(attack.defendingPlayerId);
                     if (defender.damageShield() > 0) {
@@ -841,7 +873,7 @@ void TurnManager::dealCombatDamage(bool isFirstStrikeStep) {
                     // Without trample: assign all remaining to the last blocker.
                     int assign = (trample || !isLast) ? std::min(remaining, lethal)
                                                       : remaining;
-                    applyDamageToCreature(*blk, assign, dtouch, infect, wither, atkColor);
+                    applyDamageToCreature(*blk, assign, dtouch, infect, wither, atkColor, m_game, attacker);
                     if (assign > 0) {
                         if (lifelink) m_game.gainLife(attacker->controllerId, assign);
                         std::vector<PendingTrigger> ddt;
@@ -855,6 +887,9 @@ void TurnManager::dealCombatDamage(bool isFirstStrikeStep) {
                 // Trample: leftover damage hits defending player
                 if (trample && remaining > 0) {
                     Player& defender = m_game.player(attack.defendingPlayerId);
+                    remaining = applyDamageReplacements(
+                        remaining, attacker, nullptr,
+                        static_cast<int>(attack.defendingPlayerId), m_game);
                     if (defender.damageShield() > 0) {
                         int prevented = std::min(remaining, defender.damageShield());
                         defender.addDamageShield(-prevented);
@@ -910,13 +945,13 @@ void TurnManager::dealCombatDamage(bool isFirstStrikeStep) {
                 int bandSize = 1 + static_cast<int>(attack.bandIds.size());
                 int each = power / bandSize;
                 int rem  = power % bandSize;
-                applyDamageToCreature(*attacker, each + rem, blkDtouch, blkInfect, blkWither, blkColor);
+                applyDamageToCreature(*attacker, each + rem, blkDtouch, blkInfect, blkWither, blkColor, m_game, blk);
                 for (ObjectId membId : attack.bandIds) {
                     Card* mem = m_game.findCard(membId);
-                    if (mem) applyDamageToCreature(*mem, each, blkDtouch, blkInfect, blkWither, blkColor);
+                    if (mem) applyDamageToCreature(*mem, each, blkDtouch, blkInfect, blkWither, blkColor, m_game, blk);
                 }
             } else {
-                applyDamageToCreature(*attacker, power, blkDtouch, blkInfect, blkWither, blkColor);
+                applyDamageToCreature(*attacker, power, blkDtouch, blkInfect, blkWither, blkColor, m_game, blk);
             }
             if (power > 0) {
                 if (blk->hasKeyword(KeywordAbility::Lifelink))

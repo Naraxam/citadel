@@ -64,6 +64,7 @@ public:
     void tryActivateOutlastAdapt();
     void tryUnlockRooms();
     bool tryForetell();
+    bool tryPlayImpulseFromExile();  // play impulse-draw cards from exile (MayPlay)
     bool trySuspend();
     bool tryEquipEquipment();
     void doAttackers(TurnManager& tm);

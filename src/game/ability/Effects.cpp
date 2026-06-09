@@ -77,50 +77,256 @@ void addProduced(std::string_view produced, int amount, ManaPool& pool) {
     }
 }
 
-// Check R:Event$ DamageDone replacement effects that might prevent/redirect damage.
+// Does a ValidTarget$ filter (a comma-separated list) match a damaged player `pid`,
+// evaluated from the watcher's controller perspective `wctrl`?
+static bool playerMatchesDamageTarget(std::string_view vt, int pid, uint8_t wctrl) {
+    std::string list(vt); list += ',';
+    std::string tok;
+    auto check = [&](const std::string& t) -> bool {
+        if (t == "You" && pid == static_cast<int>(wctrl)) return true;
+        if ((t == "Opponent" || t == "Player.Opponent" || t == "Player.OppCtrl")
+            && pid != static_cast<int>(wctrl)) return true;
+        if (t == "Player" || t == "Any" || t == "Player.Any") return true;
+        return false;
+    };
+    for (char ch : list) {
+        if (ch == ',' || ch == ' ') {
+            if (!tok.empty()) { if (check(tok)) return true; tok.clear(); }
+        } else tok += ch;
+    }
+    return false;
+}
+
+// Defined later in this file (anonymous namespace); forward-declared so the damage
+// prevention below can evaluate ReplaceCount$DamageAmount/<op> shield expressions.
+static int applyReplaceCountOp(std::string_view body, int base);
+
+}  // pause anonymous namespace — applyDamageReplacements has external linkage (Effects.h)
+
+// Check R:Event$ DamageDone replacement effects that might prevent damage to a card
+// or a player. Resolves the ReplaceWith$ SVar to a DB$ ReplaceDamage action and
+// prevents its Amount$ (literal, or evaluated like Count$CardCounters.AGE).
+// `targetPlayerId` is the damaged player (-1 when the target is a card).
 // Returns the modified damage amount (0 = fully prevented).
-static int applyDamageReplacements(int amount, const Card* sourceCard,
-                                    const Card* targetCard, const GameState& game) {
+int applyDamageReplacements(int amount, const Card* sourceCard,
+                            const Card* targetCard, int targetPlayerId,
+                            const GameState& game) {
     if (amount <= 0) return 0;
-    // Check target card's own R: lines for damage prevention
-    const auto checkLines = [&](const std::vector<std::string>& rlines,
-                                  bool /*isSelf*/) -> int {
+
+    auto checkWatcher = [&](const Card* watcher,
+                            const std::vector<std::string>& rlines) {
+        if (!watcher || !watcher->rules) return;
+        uint8_t wctrl = watcher->controllerId;
         for (const auto& rl : rlines) {
+            if (amount <= 0) return;
             auto s = parseScriptLine(rl);
             if (s.effectType != "DamageDone") continue;
-            // ValidSource$ filter
+            // ValidSource$ — the damage source.
             auto vs = s.get("ValidSource", "");
-            if (!vs.empty() && sourceCard &&
-                !cardMatchesAnyFilter(*sourceCard, vs, sourceCard->controllerId,
-                                      kInvalidId, nullptr, &game)) continue;
-            // ValidTarget$ filter
+            if (!vs.empty()) {
+                if (!sourceCard) continue;
+                if (!cardMatchesAnyFilter(*sourceCard, std::string(vs), wctrl, kInvalidId,
+                                          const_cast<Card*>(watcher), &game)) continue;
+            }
+            // ValidTarget$ — the damaged object (card or player).
             auto vt = s.get("ValidTarget", "");
-            if (!vt.empty() && targetCard &&
-                !cardMatchesAnyFilter(*targetCard, vt, targetCard->controllerId,
-                                      kInvalidId, nullptr, &game)) continue;
+            if (!vt.empty()) {
+                bool ok = false;
+                if (targetCard)
+                    ok = cardMatchesAnyFilter(*targetCard, std::string(vt), wctrl, kInvalidId,
+                                              const_cast<Card*>(watcher), &game);
+                if (!ok && targetPlayerId >= 0)
+                    ok = playerMatchesDamageTarget(vt, targetPlayerId, wctrl);
+                if (!ok) continue;
+            }
             auto rw = s.get("ReplaceWith", "");
-            // "PreventDamage" = prevent all damage
-            if (rw == "PreventDamage" || rw == "Prevent") return 0;
-            // "PreventDamage<N>" = prevent up to N
+            // Literal prevention forms.
+            if (rw == "PreventDamage" || rw == "Prevent") { amount = 0; return; }
             if (rw.size() > 14 && rw.substr(0, 14) == "PreventDamage<") {
                 int n = 0;
                 std::from_chars(rw.data() + 14, rw.data() + rw.size() - 1, n);
-                return std::max(0, amount - n);
+                amount = std::max(0, amount - n);
+                continue;
             }
+            // ReplaceWith$ references an SVar → DB$ ReplaceDamage | Amount$ <N|expr>.
+            auto it = watcher->rules->svars.find(std::string(rw));
+            if (it == watcher->rules->svars.end()) continue;
+            auto sub = parseScriptLine(it->second);
+            if (sub.effectType != "ReplaceDamage") continue;
+            auto amtStr = sub.get("Amount", "");
+            if (amtStr.empty()) continue;
+            // Amount$ may be a literal, an SVar name, or (via an SVar) a
+            // ReplaceCount$DamageAmount/<op> shield expression (Forcefield: prevent all but 1).
+            std::string body(amtStr);
+            auto sit = watcher->rules->svars.find(std::string(amtStr));
+            if (sit != watcher->rules->svars.end()) body = sit->second;
+            int prevent = 0;
+            if (body.rfind("ReplaceCount$DamageAmount", 0) == 0)
+                prevent = applyReplaceCountOp(body, amount);          // base = damage being dealt
+            else if (std::isdigit(static_cast<unsigned char>(body[0])))
+                std::from_chars(body.data(), body.data() + body.size(), prevent);
+            else
+                prevent = game.evaluateSVar(std::string(amtStr), wctrl,
+                                            watcher->rules, watcher->id);
+            if (prevent > 0) amount = std::max(0, amount - prevent);
         }
-        return amount;
     };
-    // Target card's own replacement lines
-    if (targetCard) amount = checkLines(targetCard->rules->replacementLines, true);
-    // Global watchers on battlefield
+
+    // The damaged card's own replacement lines first, then global battlefield watchers.
+    if (targetCard) checkWatcher(targetCard, targetCard->rules->replacementLines);
     if (amount > 0) {
         for (const Card* watcher : game.battlefield().cards()) {
             if (targetCard && watcher->id == targetCard->id) continue;
-            amount = checkLines(watcher->rules->replacementLines, false);
+            checkWatcher(watcher, watcher->rules->replacementLines);
             if (amount <= 0) break;
         }
     }
     return amount;
+}
+
+namespace {  // resume anonymous namespace
+
+// Apply a ReplaceCount$<var>/<op> operation to a base amount.
+// Supported ops: Twice (×2), Thrice (×3), Plus.N (+N), Minus.N (−N), HalfUp/HalfDown.
+static int applyReplaceCountOp(std::string_view body, int base) {
+    auto slash = body.rfind('/');
+    if (slash == std::string_view::npos) return base;
+    auto op = body.substr(slash + 1);
+    if (op == "Twice")  return base * 2;
+    if (op == "Thrice") return base * 3;
+    if (op == "HalfUp")   return (base + 1) / 2;
+    if (op == "HalfDown") return base / 2;
+    if (op.size() > 5 && op.substr(0, 5) == "Plus.") {
+        int n = 0; std::from_chars(op.data() + 5, op.data() + op.size(), n); return base + n;
+    }
+    if (op.size() > 6 && op.substr(0, 6) == "Minus.") {
+        int n = 0; std::from_chars(op.data() + 6, op.data() + op.size(), n); return std::max(0, base - n);
+    }
+    return base;
+}
+
+// Token-creation replacement effects (Doubling Season, Anointed Procession, Parallel
+// Lives, Adrix and Nev …):  R:Event$ CreateToken | ValidToken$ Card.YouCtrl |
+// ReplaceWith$ <svar>, where the svar is DB$ ReplaceToken | Type$ Amount (= double).
+// Returns the (possibly multiplied) number of tokens to create. Multiple doublers stack.
+static int applyCreateTokenReplacements(int baseCount, uint8_t tokenController,
+                                        const GameState& game) {
+    int count = baseCount;
+    for (const Card* w : game.battlefield().cards()) {
+        if (!w->rules) continue;
+        for (const auto& rl : w->rules->replacementLines) {
+            auto s = parseScriptLine(rl);
+            if (s.effectType != "CreateToken") continue;
+            // The doublers all key on "tokens you control" (ValidPlayer$ You /
+            // ValidToken$ Card.YouCtrl) — apply when the token's controller is the
+            // replacement's controller.
+            auto vp = s.get("ValidPlayer", "");
+            auto vt = s.get("ValidToken", "");
+            bool youScoped = (vp == "You") || (vt.find("YouCtrl") != std::string_view::npos);
+            if (youScoped && w->controllerId != tokenController) continue;
+            // Only the multiplier form (Type$ Amount) is handled; "create those and
+            // also X" (Type$ ReplaceToken | TokenScript$) is left for later.
+            auto rw = s.get("ReplaceWith", "");
+            auto it = w->rules->svars.find(std::string(rw));
+            if (it == w->rules->svars.end()) continue;
+            auto sub = parseScriptLine(it->second);
+            if (sub.effectType != "ReplaceToken") continue;
+            if (sub.get("Type", "") == "Amount") count *= 2;
+        }
+    }
+    return count;
+}
+
+// Counter-placement replacement effects (Doubling Season, Hardened Scales, Branching
+// Evolution, Benevolent Hydra …):  R:Event$ AddCounter | ValidCard$ … |
+// ValidCounterType$ P1P1 | ReplaceWith$ <svar>, where the svar is DB$ ReplaceCounter |
+// Amount$ <var> and <var> = ReplaceCount$CounterNum/<op>. Returns the modified amount.
+static int applyAddCounterReplacements(int baseAmount, const Card& target,
+                                       const std::string& counterKey, const GameState& game) {
+    if (baseAmount <= 0) return baseAmount;
+    std::string forgeType = (counterKey == "+1/+1") ? "P1P1"
+                          : (counterKey == "-1/-1") ? "M1M1" : counterKey;
+    int amount = baseAmount;
+    for (const Card* w : game.battlefield().cards()) {
+        if (!w->rules) continue;
+        for (const auto& rl : w->rules->replacementLines) {
+            auto s = parseScriptLine(rl);
+            if (s.effectType != "AddCounter") continue;
+            auto vct = s.get("ValidCounterType", "");
+            if (!vct.empty() && vct != forgeType) continue;
+            auto vc = s.get("ValidCard", "");
+            if (!vc.empty() && !cardMatchesAnyFilter(target, std::string(vc),
+                                                     w->controllerId, w->id, w, &game)) continue;
+            auto vp = s.get("ValidPlayer", "");
+            if (vp == "You" && w->controllerId != target.controllerId) continue;
+            auto rw = s.get("ReplaceWith", "");
+            auto it = w->rules->svars.find(std::string(rw));
+            if (it == w->rules->svars.end()) continue;
+            auto sub = parseScriptLine(it->second);
+            if (sub.effectType != "ReplaceCounter") continue;
+            // Amount$ references another SVar holding the ReplaceCount expression.
+            auto amtRef = sub.get("Amount", "");
+            std::string body;
+            auto sit = w->rules->svars.find(std::string(amtRef));
+            body = (sit != w->rules->svars.end()) ? sit->second : std::string(amtRef);
+            amount = applyReplaceCountOp(body, amount);
+        }
+    }
+    return amount;
+}
+
+// Result of mana-production replacement effects (Contamination, Infernal Darkness,
+// Mana Reflection, Chaos Moon …):  R:Event$ ProduceMana | ValidCard$ <source> |
+// ReplaceWith$ <svar=DB$ ReplaceMana | ReplaceType$ C | ReplaceAmount$ 2>.
+struct ManaRepl { bool forceColor = false; std::string color; int amountMult = 1; };
+
+static ManaRepl applyProduceManaReplacements(const Card* srcPerm, uint8_t activator,
+                                             int baseAmount, const GameState& game) {
+    ManaRepl r;
+    for (const Card* w : game.battlefield().cards()) {
+        if (!w->rules) continue;
+        for (const auto& rl : w->rules->replacementLines) {
+            auto s = parseScriptLine(rl);
+            if (s.effectType != "ProduceMana") continue;
+            // ValidCard$ — the producing permanent (land/rock) must match.
+            auto vc = s.get("ValidCard", "");
+            if (!vc.empty()) {
+                if (!srcPerm) continue;
+                if (!cardMatchesAnyFilter(*srcPerm, std::string(vc), w->controllerId,
+                                          w->id, w, &game)) continue;
+            }
+            // ValidActivator$ / ValidPlayer$ — who is tapping the source.
+            auto va = s.get("ValidActivator", "");
+            if (va.empty()) va = s.get("ValidPlayer", "");
+            if (va == "You"      && w->controllerId != activator) continue;
+            if (va == "Opponent" && w->controllerId == activator) continue;
+            // ManaAmount$ gate (e.g. GE2 — Damping Sphere).
+            auto ma = s.get("ManaAmount", "");
+            if (ma.size() >= 3) {
+                auto op = ma.substr(0, 2);
+                int n = 0; std::from_chars(ma.data() + 2, ma.data() + ma.size(), n);
+                bool ok = (op == "GE") ? baseAmount >= n : (op == "LE") ? baseAmount <= n
+                        : (op == "GT") ? baseAmount >  n : (op == "LT") ? baseAmount <  n
+                        : (op == "EQ") ? baseAmount == n : true;
+                if (!ok) continue;
+            }
+            auto rw = s.get("ReplaceWith", "");
+            auto it = w->rules->svars.find(std::string(rw));
+            if (it == w->rules->svars.end()) continue;
+            auto sub = parseScriptLine(it->second);
+            if (sub.effectType != "ReplaceMana") continue;
+            // ReplaceType$/ReplaceMana$ override the colour; ReplaceAmount$ multiplies.
+            auto col = sub.get("ReplaceType", "");
+            if (col.empty()) col = sub.get("ReplaceMana", "");
+            if (!col.empty()) { r.forceColor = true; r.color = std::string(col); }
+            auto amt = sub.get("ReplaceAmount", "");
+            if (!amt.empty() && std::isdigit(static_cast<unsigned char>(amt[0]))) {
+                int n = 0; std::from_chars(amt.data(), amt.data() + amt.size(), n);
+                if (n > 0) r.amountMult *= n;
+            }
+        }
+    }
+    return r;
 }
 
 // Deal damage from a source to one target (handles deathtouch / lifelink / shields).
@@ -135,7 +341,8 @@ void dealDamageTo(int amount, const Target& t, EffectContext& ctx) {
     // Apply R:Event$ DamageDone replacement effects before dealing damage
     {
         const Card* tgtCard = t.isCard() ? ctx.game.findCard(t.cardId) : nullptr;
-        amount = applyDamageReplacements(amount, ctx.source, tgtCard, ctx.game);
+        int tgtPlayer = t.isPlayer() ? static_cast<int>(t.playerId) : -1;
+        amount = applyDamageReplacements(amount, ctx.source, tgtCard, tgtPlayer, ctx.game);
         if (amount <= 0) return;
     }
 
@@ -437,10 +644,13 @@ bool executeEffect(const ScriptLine& script, EffectContext& ctx) {
     else if (type == "AddTurn")              { effectAddTurn(script, ctx);                  return true; }
     else if (type == "SkipTurn"
           || type == "SkipPhase")            { effectSkipTurn(script, ctx);                 return true; }
-    else if (type == "LifeSet"
+    else if (type == "SetLife"
+          || type == "LifeSet"
           || type == "LifeSetEffect")        { effectLifeSet(script, ctx);                  return true; }
-    else if (type == "ControlExchange")      { effectControlExchange(script, ctx);          return true; }
-    else if (type == "ZoneExchange")         { effectZoneExchange(script, ctx);             return true; }
+    else if (type == "ExchangeControl"
+          || type == "ControlExchange")      { effectControlExchange(script, ctx);          return true; }
+    else if (type == "ExchangeZone"
+          || type == "ZoneExchange")         { effectZoneExchange(script, ctx);             return true; }
     else if (type == "Amass")               { effectAmass(script, ctx);                    return true; }
     else if (type == "Discover")             { effectDiscover(script, ctx);                 return true; }
     else if (type == "Manifest"
@@ -453,8 +663,31 @@ bool executeEffect(const ScriptLine& script, EffectContext& ctx) {
     else if (type == "MoveCounter"
           || type == "CountersMove")         { effectMoveCounter(script, ctx);              return true; }
     else if (type == "Unattach")             { effectUnattach(script, ctx);                 return true; }
-    else if (type == "Protect"
+    // ── Chain break (MSVC C1061 nesting limit): every branch above returns, so
+    //    reaching here means none matched — a fresh if-chain is equivalent. ──
+    if      (type == "Protection"
+          || type == "ProtectionAll"
+          || type == "Protect"
           || type == "ProtectAll")           { effectProtect(script, ctx);                  return true; }
+    else if (type == "Debuff")               { effectDebuff(script, ctx);                   return true; }
+    else if (type == "TapOrUntap"
+          || type == "TapOrUntapAll"
+          || type == "TaporUntapAll")        { effectTapOrUntap(script, ctx);               return true; }
+    else if (type == "Clash")                { effectClash(script, ctx);                    return true; }
+    else if (type == "EachDamage")           { effectEachDamage(script, ctx);               return true; }
+    else if (type == "RemoveCounterAll")     { effectRemoveCounterAll(script, ctx);         return true; }
+    else if (type == "BecomesBlocked")       { effectBecomesBlocked(script, ctx);           return true; }
+    else if (type == "AddOrRemoveCounter")   { effectAddOrRemoveCounter(script, ctx);       return true; }
+    else if (type == "ExchangePower")        { effectExchangePower(script, ctx);            return true; }
+    else if (type == "ExchangeLifeVariant")  { effectExchangeLifeVariant(script, ctx);      return true; }
+    else if (type == "DrainMana")            { effectDrainMana(script, ctx);                return true; }
+    else if (type == "ManaReflected")        { effectManaReflected(script, ctx);            return true; }
+    else if (type == "Regeneration")         { effectRegenerate(script, ctx);               return true; }
+    else if (type == "ChangeTargets")        { effectChangeTargets(script, ctx);            return true; }
+    else if (type == "ControlSpell")         { effectControlSpell(script, ctx);             return true; }
+    else if (type == "GainControlVariant")   { effectGainControlVariant(script, ctx);       return true; }
+    else if (type == "ChangeCombatants")     { effectChangeCombatants(script, ctx);         return true; }
+    else if (type == "ControlPlayer")        { effectControlPlayer(script, ctx);            return true; }
     else if (type == "AnimateAll")           { effectAnimateAll(script, ctx);               return true; }
     else if (type == "Balance")              { effectBalance(script, ctx);                  return true; }
     else if (type == "Phase"
@@ -466,7 +699,8 @@ bool executeEffect(const ScriptLine& script, EffectContext& ctx) {
           || type == "ChooseName")           { effectChooseName(script, ctx);               return true; }
     else if (type == "NameCard")             { effectNameCard(script, ctx);                 return true; }
     else if (type == "TwoPiles")             { effectTwoPiles(script, ctx);                 return true; }
-    else if (type == "LifeExchange")         { effectLifeExchange(script, ctx);             return true; }
+    else if (type == "ExchangeLife"
+          || type == "LifeExchange")         { effectLifeExchange(script, ctx);             return true; }
     else if (type == "Detain")               { effectDetain(script, ctx);                   return true; }
     else if (type == "ImmediateTrigger")     { effectImmediateTrigger(script, ctx);         return true; }
     else if (type == "DelayedTrigger")       { effectDelayedTrigger(script, ctx);           return true; }
@@ -552,6 +786,28 @@ bool executeEffect(const ScriptLine& script, EffectContext& ctx) {
           || type == "Haunt"
           || type == "Subgame"
           || type == "GameDraw"
+          // Permanent spells resolve onto the battlefield via the cast path
+          // (AbilityProcessor); their effect line is a no-op.
+          || type == "PermanentCreature"
+          || type == "PermanentNoncreature"
+          || type == "Permanent"
+          // Draft-matters, planar, Un-set, and Alchemy-only mechanics with no
+          // effect in a two-player simulation.
+          || type == "Draft"
+          || type == "Planeswalk"
+          || type == "TimeTravel"
+          || type == "Heist"
+          || type == "Blight"
+          || type == "ChooseSector"
+          || type == "ClaimThePrize"
+          || type == "Camouflage"
+          || type == "MultiplePiles"
+          || type == "Intensify"      // Alchemy/digital-only mechanic
+          || type == "GainOwnership"  // ante (cards banned in real play)
+          || type == "ReorderZone"
+          || type == "FlipOntoBattlefield"
+          || type == "ExchangeTextBox"
+          || type == "LosePerpetual"
           || type == "RestartGame"
           || type == "ReverseTurnOrder"
           || type == "Ascend"
@@ -677,8 +933,18 @@ void effectDealDamage(const ScriptLine& s, EffectContext& ctx) {
 
 void effectMana(const ScriptLine& s, EffectContext& ctx) {
     int amount   = s.getIntOrX("Amount", ctx.xValue, 1);
-    auto produced = s.get("Produced", "C");
+    std::string producedStr = std::string(s.get("Produced", "C"));
+    std::string_view produced = producedStr;
     ManaPool& pool = ctx.game.player(ctx.controller).manaPool();
+
+    // Mana-production replacement effects (Contamination/Infernal Darkness force a
+    // colour; Mana Reflection doubles; Chaos Moon forces colourless). The producing
+    // permanent is ctx.source.
+    {
+        ManaRepl rep = applyProduceManaReplacements(ctx.source, ctx.controller, amount, ctx.game);
+        amount *= rep.amountMult;
+        if (rep.forceColor) { producedStr = rep.color; produced = producedStr; }
+    }
 
     // "Any colour" is just a choice over all five colours — route it through the
     // same colour-choice path as Combo so the human is prompted (and the AI picks
@@ -761,6 +1027,18 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
     }
 
     addProduced(produced, amount, pool);
+}
+
+// ManaReflected — "add one mana of any type that <source> produced" (Barbflare
+// Gremlin, A Display of My Dark Power …). Fired from a TapsForMana trigger, where
+// ctx.controller is the tapping player. The specific produced colour isn't tracked
+// at this point, so it's approximated as one mana of any colour to that player.
+void effectManaReflected(const ScriptLine& s, EffectContext& ctx) {
+    int amount = s.getIntOrX("Amount", ctx.xValue, 1);
+    auto defined = s.get("Defined", "TriggeredActivator");
+    uint8_t pid = resolveDefinedPlayer(defined, ctx.controller, ctx.triggerPlayer);
+    if (amount > 0)
+        addProduced("Any", amount, ctx.game.player(pid).manaPool());
 }
 
 // Attempt to use Dredge instead of drawing one card. Returns true if Dredge was used.
@@ -878,6 +1156,38 @@ void effectCounter(const ScriptLine& s, EffectContext& ctx) {
             ctx.remembered.push_back(c->id);
         }
         ctx.game.moveToZone(t.cardId, ZoneType::Graveyard, c->ownerId);
+    }
+}
+
+// ChangeTargets — redirect a spell/ability on the stack (Deflection, Divert, Bolt
+// Bend, Imp's Mischief …). Records the request; the actual retarget happens when the
+// affected spell resolves (AbilityProcessor::resolveTop → redirectSpellTargets), aiming
+// its targets at the redirector's opponent.
+void effectChangeTargets(const ScriptLine& s, EffectContext& ctx) {
+    (void)s;
+    auto record = [&](ObjectId id) {
+        const Card* spell = ctx.game.findCard(id);
+        if (spell && spell->zone == ZoneType::Stack)
+            ctx.game.pendingRetarget[spell->id] = ctx.controller;
+    };
+    bool any = false;
+    for (const auto& t : ctx.targets)
+        if (t.isCard()) { record(t.cardId); any = true; }
+    if (!any)
+        for (ObjectId id : ctx.remembered) record(id);
+}
+
+// ControlSpell — gain control of a spell on the stack (Aethersnatch, Commandeer …).
+// Records the new controller; applied when the spell resolves so a permanent enters
+// under the new controller and any effect benefits them.
+void effectControlSpell(const ScriptLine& s, EffectContext& ctx) {
+    auto mode = s.get("Mode", "Gain");
+    if (mode != "Gain") return;  // other modes (give control away) are rare — ignore
+    for (const auto& t : ctx.targets) {
+        if (!t.isCard()) continue;
+        const Card* spell = ctx.game.findCard(t.cardId);
+        if (!spell || spell->zone != ZoneType::Stack) continue;
+        ctx.game.pendingControlChange[spell->id] = ctx.controller;
     }
 }
 
@@ -1459,6 +1769,9 @@ void effectToken(const ScriptLine& s, EffectContext& ctx) {
     // this covers the common "attacks each combat" rider.
     bool tokMustAttack = (s.get("TokenMustAttack", "") == "True");
 
+    // Token-doubler replacement effects (Doubling Season, Anointed Procession, …).
+    amount = applyCreateTokenReplacements(amount, owner, ctx.game);
+
     for (int i = 0; i < amount; ++i) {
         Card* tok = ctx.game.createToken(name, types, colorMask, power, toughness,
                                          owner, keywords);
@@ -1501,8 +1814,13 @@ void effectPutCounter(const ScriptLine& s, EffectContext& ctx) {
         if (!c || !c->isOnBattlefield()) return;
         // Adapt: skip if the creature already has +1/+1 counters.
         if (isAdapt && c->counterCount("+1/+1") > 0) return;
-        // Doc Samson-style counter bonus: +N of the same kind for the controller.
-        int addAmt = amount + (amount > 0 ? counterBonusForController(ctx, c->controllerId) : 0);
+        // Counter-doubler replacements (Doubling Season, Hardened Scales, …) modify
+        // the base amount; the Doc Samson-style CounterBonus then adds on top.
+        int addAmt = amount;
+        if (addAmt > 0) {
+            addAmt = applyAddCounterReplacements(addAmt, *c, key, ctx.game);
+            addAmt += counterBonusForController(ctx, c->controllerId);
+        }
         c->addCounter(key, addAmt);
 
         // Fire CounterAdded triggers
@@ -1917,14 +2235,24 @@ void effectCharm(const ScriptLine& s, EffectContext& ctx) {
 }
 
 void effectDig(const ScriptLine& s, EffectContext& ctx) {
-    int digNum  = s.getInt("DigNum",    3);
-    int keepNum = s.getInt("ChangeNum", 1);
+    int  digNum     = s.getInt("DigNum", 3);
+    auto changeStr  = s.get("ChangeNum", "1");
+    int  keepNum    = (changeStr == "All") ? digNum : s.getInt("ChangeNum", 1);
+    auto destStr    = s.get("DestinationZone", "Hand");
+    bool remember   = (s.get("RememberChanged", "") == "True");
+
+    ZoneType dest = ZoneType::Hand;
+    if      (destStr == "Exile")      dest = ZoneType::Exile;
+    else if (destStr == "Graveyard")  dest = ZoneType::Graveyard;
+    else if (destStr == "Library")    dest = ZoneType::Library;
+    else if (destStr == "Battlefield")dest = ZoneType::Battlefield;
 
     Player& p = ctx.game.player(ctx.controller);
     for (int i = 0; i < keepNum && i < digNum; ++i) {
         if (p.library().empty()) { p.lose(); return; }
         Card* top = p.library().front();
-        ctx.game.moveToZone(top->id, ZoneType::Hand, ctx.controller);
+        Card* moved = ctx.game.moveToZone(top->id, dest, ctx.controller);
+        if (remember && moved) ctx.remembered.push_back(moved->id);
     }
 }
 
@@ -2030,7 +2358,262 @@ void effectEffect(const ScriptLine& s, EffectContext& ctx) {
         auto it = ctx.source->rules->svars.find(staticAbName);
         if (it == ctx.source->rules->svars.end()) return;
         auto stLine = parseScriptLine(it->second);
-        auto mode = stLine.get("Mode", "");
+        // The static line is "Mode$ <X> | ..." — parseScriptLine puts <X> in effectType.
+        const std::string& mode = stLine.effectType;
+
+        // MayPlay$ True over exiled remembered cards = impulse draw (Light Up the Stage,
+        // Reckless Impulse): the controller may play those exiled cards for a duration.
+        if (stLine.get("MayPlay", "") == "True") {
+            // "until end of your next turn" → your next turn is +2 in two-player;
+            // otherwise (this-turn) it is the current turn.
+            auto dur = s.get("Duration", "");
+            int until = (dur.find("Next") != std::string_view::npos)
+                        ? ctx.game.turnNumber() + 2 : ctx.game.turnNumber();
+            for (ObjectId id : ctx.remembered) {
+                Card* c = ctx.game.findCard(id);
+                if (c && c->zone == ZoneType::Exile) {
+                    c->mayPlayFromExile = true;
+                    c->mayPlayController = ctx.controller;
+                    c->mayPlayUntilTurn  = until;
+                }
+            }
+            return;
+        }
+
+        // CantBlockBy — "this creature can't be blocked [except by ValidBlocker] this
+        // turn" (Access Tunnel, evasion combat tricks). Applies to remembered/targeted
+        // creatures (ValidAttacker$ Card.IsRemembered/Self) or a battlefield filter.
+        if (mode == "CantBlockBy") {
+            auto validAtk = std::string(stLine.get("ValidAttacker", ""));
+            auto validBlk = std::string(stLine.get("ValidBlocker", ""));
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            auto apply = [&](Card* c) {
+                if (!c || !c->isOnBattlefield()) return;
+                if (validBlk.empty()) c->tempUnblockable = true;
+                else                  c->tempBlockOnlyBy = validBlk;
+            };
+            if (validAtk.find("IsRemembered") != std::string::npos) {
+                for (ObjectId id : ctx.remembered) apply(ctx.game.findCard(id));
+            } else if (validAtk.find("Self") != std::string::npos || validAtk.empty()) {
+                apply(ctx.source);
+            } else {
+                for (Card* c : ctx.game.battlefield().cards())
+                    if (c->isCreature() &&
+                        cardMatchesAnyFilter(*c, validAtk, ctx.controller, selfId, ctx.source, &ctx.game))
+                        apply(c);
+            }
+            return;
+        }
+
+        // Continuous keyword grants on the battlefield until end of turn:
+        //   AddKeyword$ <KW>            — grant a combat keyword (Overrun-style trample/haste/…)
+        //   AddHiddenKeyword$ … can't block. — Falter-style "creatures can't block this turn"
+        // (Stack-zone "next spell gains X" grants like Improvise/Cascade are not modelled.)
+        if (mode == "Continuous") {
+            auto affZone = stLine.get("AffectedZone", "Battlefield");
+            if (affZone.find("Battlefield") == std::string_view::npos) return;
+
+            // Player-level Continuous statics (no Affected$ creature filter).
+            // AdjustLandPlays$ N — "you may play N additional land(s) this turn".
+            if (auto alp = stLine.get("AdjustLandPlays", ""); !alp.empty()) {
+                int n = 0; std::from_chars(alp.data(), alp.data() + alp.size(), n);
+                if (n != 0) ctx.game.tempExtraLandPlays[ctx.controller] += n;
+                return;
+            }
+            // SetMaxHandSize$ N (often a big number = "no maximum hand size this turn").
+            if (auto smh = stLine.get("SetMaxHandSize", ""); !smh.empty()) {
+                int n = 0; std::from_chars(smh.data(), smh.data() + smh.size(), n);
+                ctx.game.tempMaxHandSize[ctx.controller] = std::max(n, 0);
+                return;
+            }
+
+            auto affected = std::string(stLine.get("Affected", ""));
+            if (affected.empty()) return;
+
+            uint32_t kwMask = 0;
+            if (auto addKw = stLine.get("AddKeyword", ""); !addKw.empty()) {
+                auto kw = parseKeyword(addKw);
+                if (kw != KeywordAbility::None) kwMask = static_cast<uint32_t>(kw);
+            }
+            auto hidden    = std::string(stLine.get("AddHiddenKeyword", ""));
+            bool cantBlock = hidden.find("can't block") != std::string::npos;
+            // AddPower$/AddToughness$ — "creatures get +X/+X until end of turn" (Overrun,
+            // combat pumps). Granted via the same EOT-cleared tempPower/tempToughness as Pump.
+            const CardRules* srcRules = ctx.source ? ctx.source->rules : nullptr;
+            ObjectId srcId = ctx.source ? ctx.source->id : kInvalidId;
+            auto evalStat = [&](std::string_view key) -> int {
+                auto v = stLine.get(key, "");
+                if (v.empty()) return 0;
+                if (std::isdigit(static_cast<unsigned char>(v[0])) ||
+                    (v[0] == '-' && v.size() > 1))
+                    { int n = 0; std::from_chars(v.data(), v.data() + v.size(), n); return n; }
+                return ctx.game.evaluateSVar(std::string(v), ctx.controller, srcRules, srcId);
+            };
+            int addPow = evalStat("AddPower");
+            int addTgh = evalStat("AddToughness");
+            if (kwMask == 0 && !cantBlock && addPow == 0 && addTgh == 0) return;
+
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            auto applyTo = [&](Card* c) {
+                if (!c || !c->isOnBattlefield() || !c->isCreature()) return;
+                if (kwMask)    { c->tempKeywords |= kwMask; c->keywordMask |= kwMask; }
+                if (cantBlock) c->tempCantBlock = true;
+                c->tempPower     += addPow;
+                c->tempToughness += addTgh;
+            };
+            if (affected.find("IsRemembered") != std::string::npos)
+                for (ObjectId id : ctx.remembered) applyTo(ctx.game.findCard(id));
+            else
+                for (Card* c : ctx.game.battlefield().cards())
+                    if (cardMatchesAnyFilter(*c, affected, ctx.controller, selfId, ctx.source, &ctx.game))
+                        applyTo(c);
+            return;
+        }
+
+        // CantAttack / CantBlock — "this creature can't attack/block this turn"
+        // (Blinding Light, Academic Probation). The mode may combine restrictions,
+        // e.g. "CantAttack,CantBlock,CantBeActivated". Excludes CantBlockBy (above).
+        if (mode.find("CantAttack") != std::string::npos ||
+            (mode.find("CantBlock") != std::string::npos &&
+             mode.find("CantBlockBy") == std::string::npos)) {
+            bool ca = mode.find("CantAttack") != std::string::npos;
+            bool cb = mode.find("CantBlock") != std::string::npos &&
+                      mode.find("CantBlockBy") == std::string::npos;
+            auto valid = std::string(stLine.get("ValidCard", ""));
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            auto apply = [&](Card* c) {
+                if (!c || !c->isOnBattlefield() || !c->isCreature()) return;
+                if (ca) c->tempCantAttack = true;
+                if (cb) c->tempCantBlock  = true;
+            };
+            if (valid.find("IsRemembered") != std::string::npos)
+                for (ObjectId id : ctx.remembered) apply(ctx.game.findCard(id));
+            else if (valid.find("Self") != std::string::npos)
+                apply(ctx.source);
+            else if (!valid.empty())
+                for (Card* c : ctx.game.battlefield().cards())
+                    if (c->isCreature() &&
+                        cardMatchesAnyFilter(*c, valid, ctx.controller, selfId, ctx.source, &ctx.game))
+                        apply(c);
+            return;
+        }
+
+        // CantBeCast — "[player] can't cast [spells matching ValidCard] this turn"
+        // (Silence, Abeyance, Azor). Caster$ resolves the restricted player.
+        if (mode.find("CantBeCast") != std::string::npos) {
+            auto caster = std::string(stLine.get("Caster", ""));
+            int pid = -1;
+            if      (caster == "You")                          pid = ctx.controller;
+            else if (caster.find("Opponent") != std::string::npos) pid = ctx.controller ^ 1;
+            else if (caster.find("Remembered") != std::string::npos ||
+                     caster.find("Chosen") != std::string::npos ||
+                     caster == "Player" || caster == "Targeted") {
+                for (const auto& t : ctx.targets)
+                    if (t.isPlayer()) { pid = t.playerId; break; }
+                if (pid < 0) pid = ctx.controller ^ 1;  // fallback: the opponent
+            }
+            if (pid >= 0) {
+                ctx.game.tempCantCast.emplace_back(static_cast<uint8_t>(pid),
+                                                   std::string(stLine.get("ValidCard", "")));
+            }
+            return;
+        }
+
+        // CantRegenerate — "this creature can't be regenerated this turn" (Carbonize,
+        // Disintegrate, board wipes). The regen shield won't save it.
+        if (mode.find("CantRegenerate") != std::string::npos) {
+            auto valid = std::string(stLine.get("ValidCard", ""));
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            auto apply = [&](Card* c) {
+                if (c && c->isOnBattlefield()) c->tempCantRegenerate = true;
+            };
+            if (valid.find("IsRemembered") != std::string::npos)
+                for (ObjectId id : ctx.remembered) apply(ctx.game.findCard(id));
+            else if (valid.find("Self") != std::string::npos)
+                apply(ctx.source);
+            else if (!valid.empty())
+                for (Card* c : ctx.game.battlefield().cards())
+                    if (cardMatchesAnyFilter(*c, valid, ctx.controller, selfId, ctx.source, &ctx.game))
+                        apply(c);
+            return;
+        }
+
+        // CantGainLife — "[player] can't gain life this turn" (Atarka's Command,
+        // Erebos, anti-lifegain). ValidPlayer$ resolves the restricted player(s).
+        if (mode.find("CantGainLife") != std::string::npos) {
+            auto vp = std::string(stLine.get("ValidPlayer", "Player"));
+            bool you = vp.find("You") != std::string::npos && vp.find("Opponent") == std::string::npos;
+            bool opp = vp.find("Opponent") != std::string::npos;
+            bool all = !you && !opp;  // "Player"/"Any" → everyone
+            if (you || all) ctx.game.tempCantGainLife[ctx.controller]     = true;
+            if (opp || all) ctx.game.tempCantGainLife[ctx.controller ^ 1] = true;
+            return;
+        }
+
+        // ReduceCost — "spells you cast this turn cost {N} less" (Ballad of the Black
+        // Flag, Goblin Maskmaker). Registered as a turn-scoped generic-cost reduction
+        // summed by genericReductionFor. (Type$ Activated ability-cost reductions and
+        // ForgetOnCast "next spell only" consumption are not modelled — the reduction
+        // simply lasts the turn, which is correct for the no-ForgetOnCast cards.)
+        if (mode.find("ReduceCost") != std::string::npos) {
+            if (stLine.get("Type", "Spell") != "Spell") return;
+            auto act = stLine.get("Activator", "");
+            uint8_t activator = (act == "You")      ? ctx.controller
+                              : (act == "Opponent") ? static_cast<uint8_t>(ctx.controller ^ 1)
+                              : uint8_t{255};
+            auto amtStr = stLine.get("Amount", "1");
+            int amt = 0;
+            if (!amtStr.empty() && std::isdigit(static_cast<unsigned char>(amtStr[0])))
+                std::from_chars(amtStr.data(), amtStr.data() + amtStr.size(), amt);
+            else {
+                const CardRules* sr = ctx.source ? ctx.source->rules : nullptr;
+                ObjectId sid = ctx.source ? ctx.source->id : kInvalidId;
+                amt = ctx.game.evaluateSVar(std::string(amtStr), ctx.controller, sr, sid);
+            }
+            if (amt > 0)
+                ctx.game.tempCostMods.push_back(
+                    { activator, std::string(stLine.get("ValidCard", "")), amt });
+            return;
+        }
+
+        // CantBeActivated — "[player / this permanent] can't activate non-mana
+        // abilities this turn" (Abeyance = player-wide; Braided Net = per-permanent).
+        if (mode.find("CantBeActivated") != std::string::npos) {
+            auto act = stLine.get("Activator", "");
+            if      (act == "You")                          ctx.game.tempCantActivate[ctx.controller] = true;
+            else if (act.find("Opponent") != std::string_view::npos) ctx.game.tempCantActivate[ctx.controller ^ 1] = true;
+            else if (act.find("Remembered") != std::string_view::npos ||
+                     act.find("Chosen") != std::string_view::npos || act == "Player") {
+                for (const auto& t : ctx.targets)
+                    if (t.isPlayer()) { ctx.game.tempCantActivate[t.playerId] = true; break; }
+            }
+            auto valid = std::string(stLine.get("ValidCard", ""));
+            if (valid.find("IsRemembered") != std::string::npos)
+                for (ObjectId id : ctx.remembered)
+                    if (Card* c = ctx.game.findCard(id)) c->tempCantActivate = true;
+            return;
+        }
+
+        // MustBlock — "this creature blocks this turn if able" (Academic Dispute,
+        // Berserkers' Frenzy). Sets mustBlockAny on the chosen/remembered creatures.
+        if (mode.find("MustBlock") != std::string::npos) {
+            auto valid = std::string(stLine.get("ValidCreature", std::string(stLine.get("ValidCard", ""))));
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            auto apply = [&](Card* c) {
+                if (c && c->isOnBattlefield() && c->isCreature()) c->mustBlockAny = true;
+            };
+            if (valid.find("IsRemembered") != std::string::npos ||
+                valid.find("Chosen") != std::string::npos)
+                for (ObjectId id : ctx.remembered) apply(ctx.game.findCard(id));
+            else if (valid.find("Self") != std::string::npos)
+                apply(ctx.source);
+            else if (!valid.empty())
+                for (Card* c : ctx.game.battlefield().cards())
+                    if (c->isCreature() &&
+                        cardMatchesAnyFilter(*c, valid, ctx.controller, selfId, ctx.source, &ctx.game))
+                        apply(c);
+            return;
+        }
 
         if (mode == "MustAttack") {
             // ValidCreature$ — which creatures must attack.
@@ -2192,6 +2775,52 @@ void effectGainControl(const ScriptLine& s, EffectContext& ctx) {
     } else if (Card* def = resolveDefinedCard(s, ctx)) {
         steal(def);
     }
+}
+
+// GainControlVariant — mass control change (Homeward Path, Trostani Discordant,
+// Brooding Saurian, Scrambleverse, Aminatou …). The ChangeController$ modes, reduced
+// for a two-player game:
+//   CardOwner                                → each permanent returns to its owner
+//   Random                                   → each assigned to a random player
+//   NextPlayerInChosenDirection / …Right / … → "next player" is the opponent → swap
+void effectGainControlVariant(const ScriptLine& s, EffectContext& ctx) {
+    auto valid = std::string(s.get("AllValid", "Permanent"));
+    auto mode  = s.get("ChangeController", "CardOwner");
+    ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+    bool changed = false;
+    for (Card* c : ctx.game.battlefield().cards()) {
+        if (!cardMatchesAnyFilter(*c, valid, ctx.controller, selfId, ctx.source, &ctx.game)) continue;
+        uint8_t newCtrl;
+        if      (mode == "CardOwner") newCtrl = c->ownerId;
+        else if (mode == "Random")    newCtrl = static_cast<uint8_t>(ctx.game.rng()() & 1);
+        else                          newCtrl = static_cast<uint8_t>(c->controllerId ^ 1);
+        if (newCtrl == c->controllerId) continue;
+        c->controllerId      = newCtrl;
+        c->summoningSickness = true;  // a permanent under new control can't attack/tap yet
+        changed = true;
+    }
+    if (changed) ctx.game.recomputeStaticBonuses();
+}
+
+// ControlPlayer — "you control target player during that player's next turn"
+// (Mindslaver, Sorin Markov, Worst Fears, Emrakul, Urza). Records who controls whose
+// next turn; the engine enforces it by making the controlled player take no voluntary
+// actions that turn (AiPlayer::takeTurn / the try* helpers), i.e. the controller denies
+// them their turn. Cleared at the controlled player's Cleanup step.
+void effectControlPlayer(const ScriptLine& s, EffectContext& ctx) {
+    int victim = -1;
+    for (const auto& t : ctx.targets)
+        if (t.isPlayer()) { victim = t.playerId; break; }
+    if (victim < 0) {
+        auto defined = s.get("Defined", "");
+        if (defined == "You")      victim = ctx.controller;
+        else                       victim = ctx.controller ^ 1;   // Opponent / default
+    }
+    // Controller$ may name another player; default is the effect's controller.
+    uint8_t controller = ctx.controller;
+    auto ctrlParam = s.get("Controller", "");
+    if (ctrlParam == "Opponent") controller = ctx.controller ^ 1;
+    ctx.game.setTurnController(static_cast<uint8_t>(victim), controller);
 }
 
 // PreventDamage / Fog — prevent N damage to a target or all combat damage this turn.
@@ -2474,9 +3103,10 @@ void effectPutCounterAll(const ScriptLine& s, EffectContext& ctx) {
         }
     }
     for (Card* c : affected) {
-        c->addCounter(key, num);
+        int n = applyAddCounterReplacements(num, *c, key, ctx.game);
+        c->addCounter(key, n);
         std::vector<PendingTrigger> t;
-        TriggerSystem::onCounterAdded(*c, key, num, ctx.game, t);
+        TriggerSystem::onCounterAdded(*c, key, n, ctx.game, t);
         ctx.game.queueTriggers(std::move(t));
     }
 }
@@ -3352,6 +3982,48 @@ void effectRemoveFromCombat(const ScriptLine& s, EffectContext& ctx) {
     }
 }
 
+// ChangeCombatants — put a creature into combat as an attacker, or reselect which
+// player an attacking creature is attacking.
+//   Defined$ Remembered|Self | Attacking$ True   → make that creature attack (Kari Zev's
+//                                                  Ragavan, Stormforged Armor): add it to
+//                                                  combat against its controller's opponent.
+//   ValidTgts$ Creature.attacking | Attacking$ … → reselect the target attacker's defender
+//                                                  to the opponent (clears any planeswalker
+//                                                  redirect). In two-player this is the only
+//                                                  legal defending player.
+void effectChangeCombatants(const ScriptLine& s, EffectContext& ctx) {
+    CombatState* combat = ctx.game.activeCombat;
+    if (!combat) return;  // only meaningful during combat
+
+    // Collect affected creatures: explicit targets, then Defined$.
+    std::vector<Card*> cards;
+    for (const auto& t : ctx.targets)
+        if (t.isCard()) if (Card* c = ctx.game.findCard(t.cardId)) cards.push_back(c);
+    if (cards.empty()) {
+        auto defined = std::string(s.get("Defined", ""));
+        if (defined.find("Remembered") != std::string::npos) {
+            for (ObjectId id : ctx.remembered)
+                if (Card* c = ctx.game.findCard(id)) cards.push_back(c);
+        } else if (Card* def = resolveDefinedCard(s, ctx)) {
+            cards.push_back(def);
+        }
+    }
+
+    for (Card* c : cards) {
+        if (!c || !c->isOnBattlefield() || !c->isCreature()) continue;
+        uint8_t defender = static_cast<uint8_t>(c->controllerId ^ 1);  // the opponent
+        if (CombatState::Attack* atk = combat->findAttack(c->id)) {
+            // Already attacking — reselect its defender to the opponent player.
+            atk->defendingPlayerId     = defender;
+            atk->defendingPlaneswalker = kInvalidId;
+        } else {
+            // Not yet attacking — add it to combat as an attacker.
+            combat->attacks.push_back({ c->id, defender, kInvalidId, {}, {}, false });
+            c->attacking = true;
+        }
+    }
+}
+
 // AddTurn — grant extra turn(s) to a player.
 // NumTurns$ (default 1), Defined$ (You/Opponent).
 void effectAddTurn(const ScriptLine& s, EffectContext& ctx) {
@@ -3624,28 +4296,123 @@ void effectUnattach(const ScriptLine& s, EffectContext& ctx) {
 
 // Protect — grant protection from a color to target(s).
 // Type$ (White/Blue/Black/Red/Green/All), Duration$ (EndOfTurn/Permanent).
+// Map a single colour name to its ProtectionX keyword bit (0 if unrecognised).
+static uint32_t protectionBitFromColorName(std::string_view name) {
+    if (name == "White") return static_cast<uint32_t>(KeywordAbility::ProtectionWhite);
+    if (name == "Blue")  return static_cast<uint32_t>(KeywordAbility::ProtectionBlue);
+    if (name == "Black") return static_cast<uint32_t>(KeywordAbility::ProtectionBlack);
+    if (name == "Red")   return static_cast<uint32_t>(KeywordAbility::ProtectionRed);
+    if (name == "Green") return static_cast<uint32_t>(KeywordAbility::ProtectionGreen);
+    if (name == "All" || name == "AllColors")
+        return static_cast<uint32_t>(KeywordAbility::ProtectionAll);
+    return 0;
+}
+
+// Pick the colour most represented among the opponent's permanents, returned as
+// a ProtectionX bit. Used for "gains protection from the colour of your choice":
+// the AI blanks whichever colour threatens it most. Falls back to white.
+static uint32_t protectionChoiceHeuristic(EffectContext& ctx) {
+    int cnt[5] = {0, 0, 0, 0, 0};
+    uint8_t opp = ctx.controller ^ 1;
+    for (const Card* c : ctx.game.battlefield().cards()) {
+        if (c->controllerId != opp || !c->rules) continue;
+        uint8_t cm = (c->colorIdOverride != 0xFF) ? c->colorIdOverride
+                                                  : c->rules->manaCost.colorIdentity();
+        for (int i = 0; i < 5; ++i) if (cm & (1u << i)) cnt[i]++;
+    }
+    int best = 0;
+    for (int i = 1; i < 5; ++i) if (cnt[i] > cnt[best]) best = i;
+    static const KeywordAbility byIdx[5] = {
+        KeywordAbility::ProtectionWhite, KeywordAbility::ProtectionBlue,
+        KeywordAbility::ProtectionBlack, KeywordAbility::ProtectionRed,
+        KeywordAbility::ProtectionGreen };
+    return static_cast<uint32_t>(byIdx[best]);
+}
+
+// Protection / ProtectionAll — grant protection from one or more colours.
+// Forge syntax:  Gains$ Choice | Choices$ AnyColor[,colorless]   (controller chooses)
+//                Gains$ ChosenColor                              (previously chosen colour)
+//                Gains$ White[,Blue,...]                         (explicit colours)
+//                Gains$ AllColors                                (protection from everything)
+// ProtectionAll applies to every permanent matching ValidCards$ instead of the target.
 void effectProtect(const ScriptLine& s, EffectContext& ctx) {
-    auto typeStr = s.get("Type", "");
-    auto dur     = s.get("Duration", "EndOfTurn");
+    auto dur   = s.get("Duration", "EndOfTurn");
+    auto gains = s.get("Gains", "");
+    if (gains.empty()) gains = s.get("Type", "");   // legacy citadel param
 
-    KeywordAbility prot = KeywordAbility::None;
-    if      (typeStr == "White") prot = KeywordAbility::ProtectionWhite;
-    else if (typeStr == "Blue")  prot = KeywordAbility::ProtectionBlue;
-    else if (typeStr == "Black") prot = KeywordAbility::ProtectionBlack;
-    else if (typeStr == "Red")   prot = KeywordAbility::ProtectionRed;
-    else if (typeStr == "Green") prot = KeywordAbility::ProtectionGreen;
-    else if (typeStr == "All")   prot = KeywordAbility::ProtectionAll;
-
-    if (prot == KeywordAbility::None) return;
+    uint32_t prot = 0;
+    if (gains == "Choice" || gains == "AnyColor" || gains.empty()) {
+        prot = protectionChoiceHeuristic(ctx);
+    } else if (gains == "ChosenColor") {
+        prot = protectionBitFromColorName(ctx.game.chosenColorName);
+        if (prot == 0) prot = protectionChoiceHeuristic(ctx);
+    } else {
+        // Explicit colour list (comma or space separated)
+        std::string g(gains); g += ',';
+        std::string tok;
+        for (char ch : g) {
+            if (ch == ',' || ch == ' ') {
+                if (!tok.empty()) { prot |= protectionBitFromColorName(tok); tok.clear(); }
+            } else tok += ch;
+        }
+    }
+    if (prot == 0) return;
 
     auto applyTo = [&](Card* c) {
         if (!c || !c->isOnBattlefield()) return;
-        if (dur == "Permanent")
-            c->grantKeyword(prot);
-        else {
-            c->tempKeywords |= static_cast<uint32_t>(prot);
-            c->keywordMask  |= static_cast<uint32_t>(prot);
-        }
+        if (dur == "Permanent") c->keywordMask |= prot;
+        else { c->tempKeywords |= prot; c->keywordMask |= prot; }
+    };
+
+    // Mass variant: ProtectionAll uses ValidCards$ over the whole battlefield.
+    auto validCards = s.get("ValidCards", "");
+    if (!validCards.empty()) {
+        ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+        for (Card* c : ctx.game.battlefield().cards())
+            if (cardMatchesAnyFilter(*c, std::string(validCards), ctx.controller, selfId, ctx.source, &ctx.game))
+                applyTo(c);
+        return;
+    }
+
+    if (!ctx.targets.empty()) {
+        for (const auto& t : ctx.targets)
+            if (t.isCard()) applyTo(ctx.game.findCard(t.cardId));
+    } else if (Card* def = resolveDefinedCard(s, ctx)) {
+        applyTo(def);
+    }
+}
+
+// Debuff — target creature(s) lose the listed keyword(s) until end of turn.
+// Keywords$ Flying[&Intimidate&...].  The lost keywords are restored at Cleanup
+// (see TurnManager) so they return at the start of the next turn.
+void effectDebuff(const ScriptLine& s, EffectContext& ctx) {
+    auto kwStr = std::string(s.get("Keywords", ""));
+    if (kwStr.empty()) kwStr = std::string(s.get("KW", ""));
+    if (kwStr.empty()) return;
+
+    uint32_t loseMask = 0;
+    std::string tok;
+    kwStr += '&';
+    for (char ch : kwStr) {
+        if (ch == '&') {
+            auto f = tok.find_first_not_of(' ');
+            if (f != std::string::npos) {
+                tok = tok.substr(f);
+                while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+                auto kw = parseKeyword(tok);
+                if (kw != KeywordAbility::None) loseMask |= static_cast<uint32_t>(kw);
+            }
+            tok.clear();
+        } else tok += ch;
+    }
+    if (loseMask == 0) return;
+
+    auto applyTo = [&](Card* c) {
+        if (!c || !c->isOnBattlefield()) return;
+        uint32_t actuallyHas = c->keywordMask & loseMask;
+        if (!actuallyHas) return;
+        c->tempRemovedKeywords |= actuallyHas;  // restored at end of turn
+        c->keywordMask         &= ~actuallyHas;
     };
 
     if (!ctx.targets.empty()) {
@@ -3654,6 +4421,242 @@ void effectProtect(const ScriptLine& s, EffectContext& ctx) {
     } else if (Card* def = resolveDefinedCard(s, ctx)) {
         applyTo(def);
     }
+}
+
+// TapOrUntap / TapOrUntapAll — "you may tap or untap target permanent."
+// AI heuristic: untap your own permanents (free them up), tap opponents' (lock them down).
+void effectTapOrUntap(const ScriptLine& s, EffectContext& ctx) {
+    auto act = [&](Card* c) {
+        if (!c || !c->isOnBattlefield()) return;
+        bool untap = (c->controllerId == ctx.controller);
+        c->tapped = !untap;
+    };
+
+    // Mass variant: ValidCards$ filter (optionally scoped to a target player).
+    auto validCards = s.get("ValidCards", "");
+    if (!validCards.empty()) {
+        ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+        for (Card* c : ctx.game.battlefield().cards())
+            if (cardMatchesAnyFilter(*c, std::string(validCards), ctx.controller, selfId, ctx.source, &ctx.game))
+                act(c);
+        return;
+    }
+
+    if (!ctx.targets.empty()) {
+        for (const auto& t : ctx.targets)
+            if (t.isCard()) act(ctx.game.findCard(t.cardId));
+    } else if (Card* def = resolveDefinedCard(s, ctx)) {
+        act(def);
+    }
+}
+
+// Clash — controller and an opponent each reveal the top card of their library and
+// may keep it on top or move it to the bottom. The controller "wins" if their card's
+// mana value is greater than the opponent's. On a win, WinSubAbility$ fires.
+// (AI heuristic: leave both revealed cards on top — a legal choice.)
+void effectClash(const ScriptLine& s, EffectContext& ctx) {
+    uint8_t me  = ctx.controller;
+    uint8_t opp = ctx.controller ^ 1;
+
+    auto topCmc = [&](uint8_t pid) -> int {
+        auto& lib = ctx.game.player(pid).library();
+        if (lib.empty()) return -1;        // no card revealed
+        Card* top = lib.front();
+        top->revealedToOwner = true;
+        return top->rules ? static_cast<int>(top->rules->cmc()) : 0;
+    };
+
+    int myCmc  = topCmc(me);
+    int oppCmc = topCmc(opp);
+    bool win = (myCmc > oppCmc);
+
+    auto branchSVar = win ? s.get("WinSubAbility", "")
+                          : s.get("OtherwiseSubAbility", "");
+    if (branchSVar.empty() || !ctx.source || !ctx.source->rules) return;
+    auto it = ctx.source->rules->svars.find(std::string(branchSVar));
+    if (it == ctx.source->rules->svars.end()) return;
+    auto sub = parseScriptLine(it->second);
+    if (!sub.empty()) executeEffectChain(sub, ctx);
+}
+
+// Evaluate a numeric ability param that may be a literal, "X", or a Count$/SVar
+// expression (e.g. NumDmg$ Count$CardPower).
+static int evalNumParam(const ScriptLine& s, std::string_view key, EffectContext& ctx, int dflt) {
+    auto raw = s.get(key, "");
+    if (raw.empty()) return dflt;
+    if (raw == "X") return ctx.xValue;
+    if (std::isdigit(static_cast<unsigned char>(raw[0]))) {
+        int v = 0;
+        std::from_chars(raw.data(), raw.data() + raw.size(), v);
+        return v;
+    }
+    const CardRules* rules = ctx.source ? ctx.source->rules : nullptr;
+    ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+    return ctx.game.evaluateSVar(std::string(raw), ctx.controller, rules, selfId);
+}
+
+// EachDamage — each of the "damagers" deals NumDmg to each target (or matching card).
+// DefinedDamagers$ / Defined$ pick the dealers; ValidTgts$ targets or ValidCards$ filter
+// picks the recipients. Used by group-damage spells (Alpha Brawl, Allies at Last).
+void effectEachDamage(const ScriptLine& s, EffectContext& ctx) {
+    int amount = evalNumParam(s, "NumDmg", ctx, 0);
+    if (amount <= 0) return;
+
+    // Recipients: explicit targets, else ValidCards$ filter over the battlefield.
+    std::vector<Target> recipients;
+    if (!ctx.targets.empty()) {
+        recipients = ctx.targets;
+    } else {
+        auto validCards = s.get("ValidCards", "");
+        if (!validCards.empty()) {
+            ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+            for (Card* c : ctx.game.battlefield().cards())
+                if (cardMatchesAnyFilter(*c, std::string(validCards), ctx.controller, selfId, ctx.source, &ctx.game))
+                    recipients.push_back(Target::forCard(c->id));
+        }
+    }
+    if (recipients.empty()) return;
+
+    // Damagers: each contributes its own hit. We model the aggregate by simply
+    // applying `amount` per recipient (the per-damager loop matters only for
+    // lifelink/triggers, which the common scripts don't depend on here).
+    int damagerCount = 1;
+    auto damagers = s.get("DefinedDamagers", "");
+    if (damagers == "ParentTarget" || damagers == "Remembered") {
+        // One damager (the remembered/parent card); keep aggregate at one hit each.
+        damagerCount = std::max<int>(1, static_cast<int>(ctx.remembered.size()));
+        if (damagers == "ParentTarget") damagerCount = 1;
+    }
+
+    for (const auto& r : recipients)
+        for (int i = 0; i < damagerCount; ++i)
+            dealDamageTo(amount, r, ctx);
+}
+
+// RemoveCounterAll — remove counters from every permanent matching ValidCards$.
+// AllCounterTypes$ True removes every counter type; otherwise CounterType$ is used.
+void effectRemoveCounterAll(const ScriptLine& s, EffectContext& ctx) {
+    auto validCards = std::string(s.get("ValidCards", "Permanent"));
+    bool allTypes   = (s.get("AllCounterTypes", "") == "True");
+    bool removeAll   = allTypes || (s.get("CounterNum", "") == "All");
+    int  amount     = removeAll ? INT_MAX : s.getInt("CounterNum", 1);
+
+    std::string key;
+    if (!allTypes) {
+        auto ctype = s.get("CounterType", "P1P1");
+        if      (ctype == "P1P1")    key = "+1/+1";
+        else if (ctype == "M1M1")    key = "-1/-1";
+        else if (ctype == "CHARGE")  key = "charge";
+        else if (ctype == "LOYALTY") key = "loyalty";
+        else                         key = std::string(ctype);
+    }
+
+    ObjectId selfId = ctx.source ? ctx.source->id : kInvalidId;
+    for (Card* c : ctx.game.battlefield().cards()) {
+        if (!cardMatchesAnyFilter(*c, validCards, ctx.controller, selfId, ctx.source, &ctx.game)) continue;
+        if (allTypes) {
+            c->counters.clear();
+            c->m_p1p1 = 0;
+            c->m_m1m1 = 0;
+        } else {
+            int had = c->counterCount(key);
+            int rem = removeAll ? had : std::min(amount, had);
+            if (rem > 0) c->removeCounter(key, rem);
+        }
+    }
+}
+
+// BecomesBlocked — target attacking creature becomes blocked (even with no blockers),
+// so it deals no combat damage to the player. Sets the isBlocked flag.
+void effectBecomesBlocked(const ScriptLine& s, EffectContext& ctx) {
+    auto mark = [&](Card* c) {
+        if (c && c->isOnBattlefield() && c->attacking) c->isBlocked = true;
+    };
+    if (!ctx.targets.empty()) {
+        for (const auto& t : ctx.targets)
+            if (t.isCard()) mark(ctx.game.findCard(t.cardId));
+    } else if (Card* def = resolveDefinedCard(s, ctx)) {
+        mark(def);
+    }
+}
+
+// AddOrRemoveCounter — controller chooses to add or remove a counter.
+// AI heuristic: remove a "bad" counter (-1/-1, TIME, etc.) if one is present;
+// otherwise add the named/best counter. Handles suspended cards (TgtZone Exile).
+void effectAddOrRemoveCounter(const ScriptLine& s, EffectContext& ctx) {
+    int num = s.getIntOrX("CounterNum", ctx.xValue, 1);
+    auto ctype = s.get("CounterType", "");
+    std::string key;
+    if      (ctype == "P1P1")    key = "+1/+1";
+    else if (ctype == "M1M1")    key = "-1/-1";
+    else if (ctype == "CHARGE")  key = "charge";
+    else if (ctype == "LOYALTY") key = "loyalty";
+    else if (!ctype.empty())     key = std::string(ctype);
+
+    auto apply = [&](Card* c) {
+        if (!c) return;
+        // Prefer removing a detrimental counter when present.
+        if (c->counterCount("-1/-1") > 0) { c->removeCounter("-1/-1", num); return; }
+        if (c->counterCount("TIME")  > 0) { c->removeCounter("TIME",  num); return; }
+        // Otherwise add a beneficial counter (named one, else +1/+1).
+        c->addCounter(key.empty() ? "+1/+1" : key, num);
+    };
+
+    if (!ctx.targets.empty()) {
+        for (const auto& t : ctx.targets)
+            if (t.isCard()) apply(ctx.game.findCard(t.cardId));
+    } else if (Card* def = resolveDefinedCard(s, ctx)) {
+        apply(def);
+    }
+}
+
+// ExchangePower — two target creatures swap base power (BasePower$ True).
+// Used by High Fae Prankster ("perpetually exchange ... base power").
+void effectExchangePower(const ScriptLine& s, EffectContext& ctx) {
+    (void)s;
+    std::vector<Card*> cs;
+    for (const auto& t : ctx.targets) {
+        if (!t.isCard()) continue;
+        Card* c = ctx.game.findCard(t.cardId);
+        if (c && c->isOnBattlefield()) cs.push_back(c);
+    }
+    if (cs.size() < 2) return;
+    auto basePow = [](const Card* c) {
+        return c->basePowerOverride >= 0 ? c->basePowerOverride : parseStat(c->rules->power);
+    };
+    int a = basePow(cs[0]), b = basePow(cs[1]);
+    cs[0]->basePowerOverride = b;
+    cs[1]->basePowerOverride = a;
+}
+
+// ExchangeLifeVariant — exchange a player's life total with the source's power
+// (Evra, Halcyon Witness: Mode$ Power). The creature's base power becomes the old
+// life total and the player's life becomes the creature's old power.
+void effectExchangeLifeVariant(const ScriptLine& s, EffectContext& ctx) {
+    if (!ctx.source) return;
+    auto mode    = s.get("Mode", "Power");
+    auto defined = s.get("Defined", "You");
+    uint8_t pid  = resolveDefinedPlayer(defined, ctx.controller, ctx.triggerPlayer);
+    if (mode != "Power") return;
+    int life = ctx.game.player(pid).life();
+    int pow  = effectivePower(*ctx.source);
+    ctx.game.player(pid).setLife(pow);
+    ctx.source->basePowerOverride = life;
+}
+
+// DrainMana — empty a target player's mana pool; the controller adds that much
+// (Drain Power). Colour is not preserved — the drained amount is added as generic.
+void effectDrainMana(const ScriptLine& s, EffectContext& ctx) {
+    uint8_t pid;
+    if (!ctx.targets.empty() && ctx.targets[0].isPlayer())
+        pid = ctx.targets[0].playerId;
+    else
+        pid = resolveDefinedPlayer(s.get("Defined", "Targeted"), ctx.controller, ctx.triggerPlayer);
+    ManaPool& src = ctx.game.player(pid).manaPool();
+    int amt = src.total();
+    if (amt <= 0) return;
+    src.empty();
+    ctx.game.player(ctx.controller).manaPool().addGeneric(amt);
 }
 
 // AnimateAll — animate all matching permanents (make them creatures until EOT).
@@ -3694,13 +4697,6 @@ void effectAnimateAll(const ScriptLine& s, EffectContext& ctx) {
             c->keywordMask  |= kwMask;
         }
     }
-}
-
-// DigMultiple — dig up to N cards and put specific types in hand/battlefield.
-// Like DigUntil but finds multiple cards (one of each FoundType).
-void effectDigMultiple(const ScriptLine& s, EffectContext& ctx) {
-    // Delegate to DigUntil with Amount$ = NumCards (typically 1)
-    effectDigUntil(s, ctx);
 }
 
 // Balance — each player sacrifices permanents and discards until everyone has
@@ -4010,12 +5006,6 @@ void effectAlterAttribute(const ScriptLine& s, EffectContext& ctx) {
         else
             c->attributes.erase(std::string(attrStr));
     }
-}
-
-// Populate — create a token copy of a creature token you control.
-void effectPopulate(const ScriptLine& s, EffectContext& ctx) {
-    // Delegate to CopyPermanent with Populate$ True
-    effectCopyPermanent(s, ctx);
 }
 
 // CopySpell — copy a spell on the stack.

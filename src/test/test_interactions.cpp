@@ -545,6 +545,617 @@ TEST(token_amount_by_trigger_pips) {
     ASSERT(merfolk == 2);   // two blue pips → two tokens
 }
 
+TEST(token_doubler_replacement) {
+    // Doubling Season: an effect that would create tokens you control creates twice as many.
+    mtg::GameState game;
+    auto dsRules = makeRules("Doubling Season", "Enchantment", "", "");
+    dsRules.replacementLines.push_back(
+        "Event$ CreateToken | ActiveZones$ Battlefield | ValidToken$ Card.YouCtrl | ReplaceWith$ DoubleToken");
+    dsRules.svars["DoubleToken"] = "DB$ ReplaceToken | Type$ Amount";
+    mtg::Card* ds = game.createCard(&dsRules, 0);
+    game.moveToZone(ds->id, mtg::ZoneType::Battlefield, 0);
+
+    auto makerRules = makeRules("Maker", "Creature", "1", "1");
+    mtg::Card* maker = game.createCard(&makerRules, 0);
+    game.moveToZone(maker->id, mtg::ZoneType::Battlefield, 0);
+
+    auto line = mtg::parseScriptLine(
+        "DB$ Token | TokenAmount$ 1 | TokenName$ Soldier | TokenTypes$ Creature Soldier | "
+        "TokenPower$ 1 | TokenToughness$ 1");
+    mtg::EffectContext ctx{ game, maker, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(line, ctx);
+
+    int soldiers = 0;
+    for (const mtg::Card* c : game.battlefield().cards())
+        if (c->isToken && c->name() == "Soldier") ++soldiers;
+    ASSERT(soldiers == 2);   // one doubled to two
+}
+
+TEST(counter_doubler_replacement) {
+    // Doubling Season also doubles counters placed on your permanents.
+    mtg::GameState game;
+    auto dsRules = makeRules("Doubling Season", "Enchantment", "", "");
+    dsRules.replacementLines.push_back(
+        "Event$ AddCounter | ActiveZones$ Battlefield | ValidCard$ Creature.YouCtrl | ReplaceWith$ DoubleCounters");
+    dsRules.svars["DoubleCounters"] = "DB$ ReplaceCounter | Amount$ Y";
+    dsRules.svars["Y"] = "ReplaceCount$CounterNum/Twice";
+    mtg::Card* ds = game.createCard(&dsRules, 0);
+    game.moveToZone(ds->id, mtg::ZoneType::Battlefield, 0);
+
+    auto bearRules = makeRules("Bear", "Creature", "2", "2");
+    mtg::Card* bear   = game.createCard(&bearRules, 0);
+    mtg::Card* bearBf = game.moveToZone(bear->id, mtg::ZoneType::Battlefield, 0);
+
+    auto line = mtg::parseScriptLine("DB$ PutCounter | CounterType$ P1P1 | CounterNum$ 2");
+    std::vector<mtg::Target> tgts{ mtg::Target::forCard(bearBf->id) };
+    mtg::EffectContext ctx{ game, ds, static_cast<uint8_t>(0), tgts, 0 };
+    mtg::executeEffect(line, ctx);
+    ASSERT(bearBf->counterCount("+1/+1") == 4);   // two doubled to four
+}
+
+TEST(replace_mana_forces_color) {
+    // Infernal Darkness: all lands produce black mana instead of any other type.
+    mtg::GameState game;
+    auto idRules = makeRules("Infernal Darkness", "Enchantment", "", "");
+    idRules.replacementLines.push_back(
+        "Event$ ProduceMana | ActiveZones$ Battlefield | ValidCard$ Land | ReplaceWith$ ProduceB");
+    idRules.svars["ProduceB"] = "DB$ ReplaceMana | ReplaceType$ B";
+    mtg::Card* id = game.createCard(&idRules, 0);
+    game.moveToZone(id->id, mtg::ZoneType::Battlefield, 0);
+
+    auto forestRules = makeRules("Forest", "Basic Land Forest", "", "");
+    mtg::Card* forest   = game.createCard(&forestRules, 0);
+    mtg::Card* forestBf = game.moveToZone(forest->id, mtg::ZoneType::Battlefield, 0);
+
+    auto line = mtg::parseScriptLine("AB$ Mana | Produced$ G | Amount$ 1");
+    mtg::EffectContext ctx{ game, forestBf, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(line, ctx);
+
+    mtg::ManaPool& pool = game.player(0).manaPool();
+    ASSERT(pool.canPay(mtg::ManaCost::parse("B")));    // produced black instead
+    ASSERT(!pool.canPay(mtg::ManaCost::parse("G")));   // not green
+}
+
+TEST(replace_mana_doubles_amount) {
+    // Mana Reflection: your permanents produce twice as much mana.
+    mtg::GameState game;
+    auto mrRules = makeRules("Mana Reflection", "Enchantment", "", "");
+    mrRules.replacementLines.push_back(
+        "Event$ ProduceMana | ActiveZones$ Battlefield | ValidActivator$ You | ValidCard$ Land | ReplaceWith$ ProduceTwice");
+    mrRules.svars["ProduceTwice"] = "DB$ ReplaceMana | ReplaceAmount$ 2";
+    mtg::Card* mr = game.createCard(&mrRules, 0);
+    game.moveToZone(mr->id, mtg::ZoneType::Battlefield, 0);
+
+    auto forestRules = makeRules("Forest", "Basic Land Forest", "", "");
+    mtg::Card* forest   = game.createCard(&forestRules, 0);
+    mtg::Card* forestBf = game.moveToZone(forest->id, mtg::ZoneType::Battlefield, 0);
+
+    auto line = mtg::parseScriptLine("AB$ Mana | Produced$ G | Amount$ 1");
+    mtg::EffectContext ctx{ game, forestBf, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(line, ctx);
+
+    mtg::ManaPool& pool = game.player(0).manaPool();
+    ASSERT(pool.canPay(mtg::ManaCost::parse("G G")));   // one doubled to two
+}
+
+TEST(change_targets_redirects_spell) {
+    // Deflection: a spell aimed at you is redirected to its caster (your opponent).
+    GameState game;
+    AbilityProcessor abilities(game);
+    game.player(0).setLife(20);
+    game.player(1).setLife(20);
+
+    // Player 1 casts a 3-damage bolt targeting player 0.
+    auto boltRules = makeRules("Zap", "Instant", "", "");
+    boltRules.abilityLines.push_back("SP$ DealDamage | ValidTgts$ Any | NumDmg$ 3");
+    mtg::Card* boltLib  = game.createCard(&boltRules, 1);
+    mtg::Card* boltHand = game.moveToZone(boltLib->id, mtg::ZoneType::Hand, 1);
+    ASSERT(abilities.castSpell(boltHand->id, 1, { mtg::Target::forPlayer(0) }));
+
+    mtg::Card* onStack = nullptr;
+    for (mtg::Card* c : game.stack().cards()) onStack = c;
+    ASSERT(onStack != nullptr);
+
+    // Player 0 resolves a ChangeTargets at the bolt.
+    std::vector<mtg::Target> tgts{ mtg::Target::forCard(onStack->id) };
+    mtg::EffectContext ctx{ game, nullptr, static_cast<uint8_t>(0), tgts, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ ChangeTargets | Defined$ Targeted"), ctx);
+
+    abilities.resolveTop();   // resolve the bolt with redirected target
+    ASSERT(game.player(0).life() == 20);   // original target spared
+    ASSERT(game.player(1).life() == 17);   // bolt redirected back at the caster
+}
+
+TEST(control_spell_changes_controller) {
+    // Commandeer: gain control of a spell on the stack; its permanent enters under you.
+    GameState game;
+    AbilityProcessor abilities(game);
+
+    auto critRules = makeRules("Ogre", "Creature", "3", "3");
+    mtg::Card* lib  = game.createCard(&critRules, 1);
+    mtg::Card* hand = game.moveToZone(lib->id, mtg::ZoneType::Hand, 1);
+    ASSERT(abilities.castSpell(hand->id, 1, {}));
+
+    mtg::Card* onStack = nullptr;
+    for (mtg::Card* c : game.stack().cards()) onStack = c;
+    ASSERT(onStack != nullptr);
+
+    std::vector<mtg::Target> tgts{ mtg::Target::forCard(onStack->id) };
+    mtg::EffectContext ctx{ game, nullptr, static_cast<uint8_t>(0), tgts, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ ControlSpell | Mode$ Gain"), ctx);
+
+    abilities.resolveTop();   // resolve the creature spell under the new controller
+    mtg::Card* ogre = nullptr;
+    for (mtg::Card* c : game.battlefield().cards()) if (c->name() == "Ogre") ogre = c;
+    ASSERT(ogre != nullptr);
+    ASSERT(ogre->controllerId == 0);   // gained control
+}
+
+TEST(gain_control_variant_to_owner) {
+    // Homeward Path: each player gains control of all creatures they own.
+    GameState game;
+    // A creature owned by player 1 but currently controlled by player 0 (stolen).
+    auto r = makeRules("Ogre", "Creature", "3", "3");
+    mtg::Card* lib = game.createCard(&r, 1);            // owner = 1
+    mtg::Card* ogre = game.moveToZone(lib->id, mtg::ZoneType::Battlefield, 1);
+    ogre->controllerId = 0;                              // stolen by player 0
+
+    auto line = mtg::parseScriptLine(
+        "DB$ GainControlVariant | AllValid$ Creature | ChangeController$ CardOwner");
+    mtg::EffectContext ctx{ game, nullptr, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(line, ctx);
+    ASSERT(ogre->controllerId == 1);   // returned to its owner
+}
+
+TEST(gain_control_variant_swap) {
+    // Inniaz-style: each nonland permanent goes to the next player (the opponent in 2p).
+    GameState game;
+    auto r0 = makeRules("Mine", "Creature", "2", "2");
+    mtg::Card* l0 = game.createCard(&r0, 0);
+    mtg::Card* mine = game.moveToZone(l0->id, mtg::ZoneType::Battlefield, 0);
+    auto r1 = makeRules("Yours", "Creature", "2", "2");
+    mtg::Card* l1 = game.createCard(&r1, 1);
+    mtg::Card* yours = game.moveToZone(l1->id, mtg::ZoneType::Battlefield, 1);
+
+    auto line = mtg::parseScriptLine(
+        "DB$ GainControlVariant | AllValid$ Permanent.nonLand | ChangeController$ NextPlayerInChosenDirection");
+    mtg::EffectContext ctx{ game, nullptr, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(line, ctx);
+    ASSERT(mine->controllerId == 1);    // swapped
+    ASSERT(yours->controllerId == 0);   // swapped
+}
+
+TEST(change_combatants_makes_attacker) {
+    // Kari Zev-style: ChangeCombatants puts a second creature into combat as an attacker.
+    GameState game;
+    TurnManager tm{game};
+    game.setActivePlayer(0);
+
+    // An attacker already in combat (this sets activeCombat).
+    auto ar = makeRules("Kari Zev", "Creature", "1", "3");
+    mtg::Card* aLib = game.createCard(&ar, 0);
+    mtg::Card* kari = game.moveToZone(aLib->id, mtg::ZoneType::Battlefield, 0);
+    kari->summoningSickness = false;
+    tm.declareAttacker(kari->id, 1);
+    ASSERT(game.activeCombat != nullptr);
+
+    // A second creature not yet attacking (e.g. the Ragavan token).
+    auto rr = makeRules("Ragavan", "Creature", "2", "1");
+    mtg::Card* rLib = game.createCard(&rr, 0);
+    mtg::Card* rag  = game.moveToZone(rLib->id, mtg::ZoneType::Battlefield, 0);
+
+    mtg::EffectContext ctx{ game, kari, static_cast<uint8_t>(0), {}, 0 };
+    ctx.remembered = { rag->id };
+    mtg::executeEffect(
+        mtg::parseScriptLine("DB$ ChangeCombatants | Defined$ Remembered | Attacking$ True"), ctx);
+
+    ASSERT(game.activeCombat->isAttacking(rag->id));
+    ASSERT(rag->attacking);
+    ASSERT(game.activeCombat->findAttack(rag->id)->defendingPlayerId == 1);
+}
+
+TEST(replace_damage_prevents_combat) {
+    // Daunting Defender: prevent 1 damage dealt to a Cleric you control.
+    GameState game;
+    TurnManager tm{game};
+    game.setActivePlayer(1);   // player 1 attacks
+
+    // The prevention source: an enchantment-like permanent for player 0 with the R: line.
+    auto ddRules = makeRules("Daunting Defender", "Enchantment", "", "");
+    ddRules.replacementLines.push_back(
+        "Event$ DamageDone | ActiveZones$ Battlefield | ValidTarget$ Creature.YouCtrl | ReplaceWith$ DBReplace | PreventionEffect$ True");
+    ddRules.svars["DBReplace"] = "DB$ ReplaceDamage | Amount$ 1";
+    mtg::Card* ddLib = game.createCard(&ddRules, 0);
+    game.moveToZone(ddLib->id, mtg::ZoneType::Battlefield, 0);
+
+    // Player 0's blocker (3 toughness) and player 1's 2-power attacker.
+    auto blkR = makeRules("Cleric", "Creature", "0", "3");
+    mtg::Card* blkLib = game.createCard(&blkR, 0);
+    mtg::Card* blk = game.moveToZone(blkLib->id, mtg::ZoneType::Battlefield, 0);
+    auto atkR = makeRules("Raider", "Creature", "2", "2");
+    mtg::Card* atkLib = game.createCard(&atkR, 1);
+    mtg::Card* atk = game.moveToZone(atkLib->id, mtg::ZoneType::Battlefield, 1);
+    atk->summoningSickness = false;
+
+    tm.declareAttacker(atk->id, 0);
+    tm.mutableCombatState().attacks[0].blockerIds.push_back(blk->id);
+    blk->blocking = true;
+    tm.dealCombatDamage(false);
+
+    // 2 power − 1 prevented = 1 marked on the blocker.
+    ASSERT(blk->markedDamage == 1);
+}
+
+TEST(replace_damage_prevents_to_player) {
+    // Guardian Seraph: prevent 1 damage from an opponent's source dealt to you.
+    GameState game;
+    game.player(0).setLife(20);
+
+    auto gsRules = makeRules("Guardian Seraph", "Creature", "3", "4");
+    gsRules.replacementLines.push_back(
+        "Event$ DamageDone | ActiveZones$ Battlefield | ValidSource$ Card.OppCtrl | ValidTarget$ You | ReplaceWith$ DBReplace | PreventionEffect$ True");
+    gsRules.svars["DBReplace"] = "DB$ ReplaceDamage | Amount$ 1";
+    mtg::Card* gsLib = game.createCard(&gsRules, 0);
+    game.moveToZone(gsLib->id, mtg::ZoneType::Battlefield, 0);
+
+    // Opponent's bolt deals 3 to player 0 → 1 prevented → 2 lost.
+    auto boltRules = makeRules("Zap", "Instant", "", "");
+    mtg::Card* bolt = game.createCard(&boltRules, 1);  // controlled by player 1
+    auto line = mtg::parseScriptLine("SP$ DealDamage | NumDmg$ 3");
+    std::vector<mtg::Target> tgts{ mtg::Target::forPlayer(0) };
+    mtg::EffectContext ctx{ game, bolt, static_cast<uint8_t>(1), tgts, 0 };
+    mtg::executeEffect(line, ctx);
+    ASSERT(game.player(0).life() == 18);   // 3 − 1 prevented
+}
+
+TEST(replace_damage_shield_all_but_one) {
+    // Forcefield: prevent all but 1 damage a creature would deal to you
+    // (Amount$ ShieldAmount = ReplaceCount$DamageAmount/Minus.1).
+    GameState game;
+    auto ffRules = makeRules("Forcefield", "Artifact", "", "");
+    ffRules.replacementLines.push_back(
+        "Event$ DamageDone | ActiveZones$ Battlefield | ValidSource$ Creature | ValidTarget$ You | ReplaceWith$ PreventDmg | PreventionEffect$ True");
+    ffRules.svars["PreventDmg"]   = "DB$ ReplaceDamage | Amount$ ShieldAmount";
+    ffRules.svars["ShieldAmount"] = "ReplaceCount$DamageAmount/Minus.1";
+    mtg::Card* ff = game.createCard(&ffRules, 0);
+    game.moveToZone(ff->id, mtg::ZoneType::Battlefield, 0);
+
+    auto srcR = makeRules("Beast", "Creature", "5", "5");
+    mtg::Card* beast = game.createCard(&srcR, 1);
+    game.moveToZone(beast->id, mtg::ZoneType::Battlefield, 1);
+
+    int got = mtg::applyDamageReplacements(5, beast, nullptr, 0, game);
+    ASSERT(got == 1);   // all but 1 prevented
+}
+
+TEST(control_player_sets_marker) {
+    // ControlPlayer records who controls whose next turn.
+    GameState game;
+    std::vector<mtg::Target> tgts{ mtg::Target::forPlayer(1) };
+    mtg::EffectContext ctx{ game, nullptr, static_cast<uint8_t>(0), tgts, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("AB$ ControlPlayer | ValidTgts$ Player"), ctx);
+    ASSERT(game.isTurnControlled(1));
+    ASSERT(game.turnControllerOf[1] == 0);
+}
+
+TEST(control_player_denies_actions) {
+    // A controlled player takes no voluntary actions (no land, etc.) that turn.
+    GameState game;
+    AbilityProcessor abilities(game);
+    AiPlayer ai1(1, game, abilities);
+    game.setActivePlayer(1);
+
+    auto landR = makeRules("Forest", "Basic Land Forest", "", "");
+    mtg::Card* landLib = game.createCard(&landR, 1);
+    game.moveToZone(landLib->id, mtg::ZoneType::Hand, 1);
+
+    // Player 0 controls player 1's turn → player 1 plays no land.
+    game.setTurnController(1, 0);
+    ASSERT(!ai1.tryPlayLand());
+    ASSERT(game.player(1).hand().size() == 1);   // land still in hand
+
+    // Release control → the land becomes playable again.
+    game.clearTurnController(1);
+    ASSERT(ai1.tryPlayLand());
+    ASSERT(game.player(1).hand().size() == 0);   // land played
+}
+
+TEST(impulse_draw_exile_then_play) {
+    // Reckless Impulse: exile top 2 cards; until end of your next turn you may play them.
+    GameState game;
+    game.setActivePlayer(0);
+
+    // Library: two castable spells on top.
+    auto spellR = makeRules("Bolt", "Instant", "", "");
+    spellR.abilityLines.push_back("SP$ GainLife | LifeAmount$ 1 | Defined$ You");
+    mtg::Card* s1 = game.createCard(&spellR, 0);
+    mtg::Card* s2 = game.createCard(&spellR, 0);
+    game.moveToZone(s1->id, mtg::ZoneType::Library, 0);
+    game.moveToZone(s2->id, mtg::ZoneType::Library, 0);
+
+    // The impulse spell itself, carrying the Dig + Effect(MayPlay) chain as SVars.
+    auto impRules = makeRules("Reckless Impulse", "Sorcery", "", "");
+    impRules.svars["DBEffect"]  = "DB$ Effect | StaticAbilities$ STPlay | RememberObjects$ Remembered | Duration$ UntilTheEndOfYourNextTurn";
+    impRules.svars["STPlay"]    = "Mode$ Continuous | MayPlay$ True | Affected$ Card.IsRemembered | AffectedZone$ Exile";
+    mtg::Card* imp = game.createCard(&impRules, 0);
+
+    auto line = mtg::parseScriptLine(
+        "SP$ Dig | DigNum$ 2 | ChangeNum$ All | DestinationZone$ Exile | RememberChanged$ True | SubAbility$ DBEffect");
+    mtg::EffectContext ctx{ game, imp, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffectChain(line, ctx);
+
+    // Both cards exiled and flagged playable by player 0.
+    int exiledPlayable = 0;
+    for (const mtg::Card* c : game.exile().cards())
+        if (c->mayPlayFromExile && c->mayPlayController == 0) ++exiledPlayable;
+    ASSERT(exiledPlayable == 2);
+
+    // The AI can now play one of them from exile.
+    AbilityProcessor abilities(game);
+    AiPlayer ai0(0, game, abilities);
+    ASSERT(ai0.tryPlayImpulseFromExile());
+}
+
+TEST(temp_unblockable_via_effect) {
+    // Access Tunnel: DB$ Effect | Mode$ CantBlockBy makes a creature unblockable this turn.
+    GameState game;
+    TurnManager tm{game};
+    game.setActivePlayer(0);
+
+    auto atkR = makeRules("Sneak", "Creature", "2", "2");
+    mtg::Card* atkLib = game.createCard(&atkR, 0);
+    mtg::Card* atk = game.moveToZone(atkLib->id, mtg::ZoneType::Battlefield, 0);
+    atk->summoningSickness = false;
+    auto blkR = makeRules("Wall", "Creature", "0", "4");
+    mtg::Card* blkLib = game.createCard(&blkR, 1);
+    mtg::Card* blk = game.moveToZone(blkLib->id, mtg::ZoneType::Battlefield, 1);
+
+    // Grant "can't be blocked this turn" to the attacker via a DB$ Effect.
+    auto impRules = makeRules("Access Tunnel", "Artifact", "", "");
+    impRules.svars["Unblockable"] = "Mode$ CantBlockBy | ValidAttacker$ Card.IsRemembered";
+    mtg::Card* imp = game.createCard(&impRules, 0);
+    mtg::EffectContext ctx{ game, imp, static_cast<uint8_t>(0), {}, 0 };
+    ctx.remembered = { atk->id };
+    mtg::executeEffect(
+        mtg::parseScriptLine("DB$ Effect | StaticAbilities$ Unblockable | RememberObjects$ Remembered"), ctx);
+    ASSERT(atk->tempUnblockable);
+
+    // The wall can no longer block it.
+    tm.declareAttacker(atk->id, 1);
+    ASSERT(!tm.declareBlocker(blk->id, atk->id));
+}
+
+TEST(effect_grants_keyword_until_eot) {
+    // DB$ Effect | Mode$ Continuous | AddKeyword$ Trample grants the keyword to your team.
+    GameState game;
+    auto bearR = makeRules("Bear", "Creature", "2", "2");
+    mtg::Card* bearLib = game.createCard(&bearR, 0);
+    mtg::Card* bear = game.moveToZone(bearLib->id, mtg::ZoneType::Battlefield, 0);
+    ASSERT(!bear->hasKeyword(mtg::KeywordAbility::Trample));
+
+    auto srcR = makeRules("Overrun", "Sorcery", "", "");
+    srcR.svars["KWPump"] = "Mode$ Continuous | Affected$ Creature.YouCtrl | AffectedZone$ Battlefield | AddKeyword$ Trample";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ KWPump"), ctx);
+    ASSERT(bear->hasKeyword(mtg::KeywordAbility::Trample));
+}
+
+TEST(effect_cant_block_until_eot) {
+    // Falter: DB$ Effect | AddHiddenKeyword$ "... can't block." stops blocks this turn.
+    GameState game;
+    TurnManager tm{game};
+    game.setActivePlayer(0);
+
+    auto atkR = makeRules("Raider", "Creature", "2", "2");
+    mtg::Card* atkLib = game.createCard(&atkR, 0);
+    mtg::Card* atk = game.moveToZone(atkLib->id, mtg::ZoneType::Battlefield, 0);
+    atk->summoningSickness = false;
+    auto blkR = makeRules("Wall", "Creature", "0", "4");
+    mtg::Card* blkLib = game.createCard(&blkR, 1);
+    mtg::Card* blk = game.moveToZone(blkLib->id, mtg::ZoneType::Battlefield, 1);
+
+    auto srcR = makeRules("Falter", "Sorcery", "", "");
+    srcR.svars["NoBlock"] = "Mode$ Continuous | Affected$ Creature | AffectedZone$ Battlefield | AddHiddenKeyword$ CARDNAME can't block.";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoBlock"), ctx);
+    ASSERT(blk->tempCantBlock);
+
+    tm.declareAttacker(atk->id, 1);
+    ASSERT(!tm.declareBlocker(blk->id, atk->id));   // wall can't block
+}
+
+TEST(effect_cant_attack_until_eot) {
+    // Blinding Light-style: DB$ Effect | Mode$ CantAttack stops attacks this turn.
+    GameState game;
+    TurnManager tm{game};
+    game.setActivePlayer(0);
+
+    auto atkR = makeRules("Raider", "Creature", "2", "2");
+    mtg::Card* atkLib = game.createCard(&atkR, 0);
+    mtg::Card* atk = game.moveToZone(atkLib->id, mtg::ZoneType::Battlefield, 0);
+    atk->summoningSickness = false;
+
+    // Normally it could attack.
+    ASSERT(tm.declareAttacker(atk->id, 1));
+    tm.mutableCombatState().clear();
+    atk->attacking = false;
+
+    auto srcR = makeRules("Blinding Light", "Sorcery", "", "");
+    srcR.svars["NoAtk"] = "Mode$ CantAttack | ValidCard$ Creature";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoAtk"), ctx);
+    ASSERT(atk->tempCantAttack);
+    ASSERT(!tm.declareAttacker(atk->id, 1));   // now can't attack
+}
+
+TEST(effect_cant_be_cast_this_turn) {
+    // Silence/Abeyance: DB$ Effect | Mode$ CantBeCast stops a player casting this turn.
+    GameState game;
+    AbilityProcessor abilities(game);
+
+    // Player 1 has a castable spell in hand.
+    auto spellR = makeRules("Growth", "Instant", "", "");
+    spellR.abilityLines.push_back("SP$ GainLife | LifeAmount$ 1 | Defined$ You");
+    mtg::Card* spLib = game.createCard(&spellR, 1);
+    mtg::Card* sp = game.moveToZone(spLib->id, mtg::ZoneType::Hand, 1);
+
+    // Player 0 resolves an Effect: opponents can't cast spells this turn.
+    auto srcR = makeRules("Silence", "Instant", "", "");
+    srcR.svars["NoCast"] = "Mode$ CantBeCast | ValidCard$ Card | Caster$ Opponent";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoCast"), ctx);
+
+    // Player 1 (the opponent) now can't cast.
+    ASSERT(!game.tempCantCast.empty());
+    ASSERT(!abilities.castSpell(sp->id, 1, {}));
+    // Player 0 (controller) is unaffected — sanity: restriction targets player 1 only.
+    ASSERT(game.tempCantCast[0].first == 1);
+}
+
+TEST(cant_regenerate_overrides_shield) {
+    // Carbonize: a creature with a regen shield still dies when it can't be regenerated.
+    GameState game;
+    auto r = makeRules("Troll", "Creature", "2", "2");
+    mtg::Card* lib = game.createCard(&r, 0);
+    mtg::Card* troll = game.moveToZone(lib->id, mtg::ZoneType::Battlefield, 0);
+    troll->addCounter("regen", 1);    // regeneration shield
+    troll->markedDamage = 5;          // lethal damage marked
+
+    auto srcR = makeRules("Carbonize", "Instant", "", "");
+    srcR.svars["NoRegen"] = "Mode$ CantRegenerate | ValidCard$ Card.IsRemembered";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    ctx.remembered = { troll->id };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoRegen"), ctx);
+    ASSERT(troll->tempCantRegenerate);
+
+    StateBasedActions::run(game);
+    ASSERT(game.findCard(troll->id) == nullptr);   // died — regen shield ignored
+}
+
+TEST(effect_anthem_pt_until_eot) {
+    // Overrun-style: DB$ Effect | Mode$ Continuous | AddPower/AddToughness pumps your team.
+    GameState game;
+    auto bearR = makeRules("Bear", "Creature", "2", "2");
+    mtg::Card* bearLib = game.createCard(&bearR, 0);
+    mtg::Card* bear = game.moveToZone(bearLib->id, mtg::ZoneType::Battlefield, 0);
+
+    auto srcR = makeRules("Overrun", "Sorcery", "", "");
+    srcR.svars["Pump"] = "Mode$ Continuous | Affected$ Creature.YouCtrl | AffectedZone$ Battlefield | AddPower$ 3 | AddToughness$ 3 | AddKeyword$ Trample";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ Pump"), ctx);
+    ASSERT(mtg::effectivePower(*bear) == 5);
+    ASSERT(mtg::effectiveToughness(*bear) == 5);
+    ASSERT(bear->hasKeyword(mtg::KeywordAbility::Trample));
+}
+
+TEST(effect_cant_gain_life_this_turn) {
+    // Atarka's Command: DB$ Effect | Mode$ CantGainLife stops a player gaining life.
+    GameState game;
+    game.player(1).setLife(20);
+
+    auto srcR = makeRules("Atarka's Command", "Instant", "", "");
+    srcR.svars["NoGain"] = "Mode$ CantGainLife | ValidPlayer$ Player.Opponent";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoGain"), ctx);
+    ASSERT(game.tempCantGainLife[1]);
+
+    bool gained = game.gainLife(1, 5);
+    ASSERT(!gained);
+    ASSERT(game.player(1).life() == 20);   // no life gained
+}
+
+TEST(effect_extra_land_play) {
+    // Explore: DB$ Effect | AdjustLandPlays$ 1 lets you play an additional land this turn.
+    GameState game;
+    game.setActivePlayer(0);
+    ASSERT(game.landPlayLimit(0) == 1);   // base
+
+    auto srcR = makeRules("Explore", "Sorcery", "", "");
+    srcR.svars["MoreLand"] = "Mode$ Continuous | AdjustLandPlays$ 1";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ MoreLand"), ctx);
+    ASSERT(game.landPlayLimit(0) == 2);   // one extra land play
+    ASSERT(game.tempExtraLandPlays[0] == 1);
+}
+
+TEST(effect_no_max_hand_size) {
+    // "No maximum hand size this turn": discard step keeps all cards.
+    GameState game;
+    auto srcR = makeRules("Spellbook", "Enchantment", "", "");
+    srcR.svars["MaxHand"] = "Mode$ Continuous | SetMaxHandSize$ 99";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ MaxHand"), ctx);
+    ASSERT(game.tempMaxHandSize[0] == 99);
+}
+
+TEST(effect_reduce_cost_this_turn) {
+    // Ballad of the Black Flag: DB$ Effect | Mode$ ReduceCost makes your spells cost less.
+    GameState game;
+    AbilityProcessor abilities(game);
+
+    auto spR = makeRules("Big Spell", "Sorcery", "", "");
+    mtg::Card* sp = game.createCard(&spR, 0);
+    ASSERT(abilities.genericReductionFor(*sp, 0) == 0);   // baseline
+
+    auto srcR = makeRules("Ballad", "Enchantment", "", "");
+    srcR.svars["Reduce"] = "Mode$ ReduceCost | Type$ Spell | Activator$ You | Amount$ 2";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ Reduce"), ctx);
+
+    ASSERT(abilities.genericReductionFor(*sp, 0) == 2);   // 2 less for player 0
+    ASSERT(abilities.genericReductionFor(*sp, 1) == 0);   // not the opponent (Activator$ You)
+}
+
+TEST(effect_cant_activate_abilities) {
+    // Abeyance: DB$ Effect | Mode$ CantBeActivated stops a player's non-mana abilities.
+    GameState game;
+    AbilityProcessor abilities(game);
+
+    // A permanent with an activated ability for player 1.
+    auto pR = makeRules("Pinger", "Artifact", "", "");
+    pR.abilityLines.push_back("AB$ DealDamage | Cost$ T | NumDmg$ 1 | ValidTgts$ Any");
+    mtg::Card* p = game.createCard(&pR, 1);
+    game.moveToZone(p->id, mtg::ZoneType::Battlefield, 1);
+
+    // Player 0 resolves: opponents can't activate abilities this turn.
+    auto srcR = makeRules("Abeyance", "Instant", "", "");
+    srcR.svars["NoAct"] = "Mode$ CantBeActivated | ValidCard$ Card | Activator$ Opponent";
+    mtg::Card* src = game.createCard(&srcR, 0);
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ NoAct"), ctx);
+    ASSERT(game.tempCantActivate[1]);
+
+    std::vector<mtg::Target> tgts{ mtg::Target::forPlayer(0) };
+    ASSERT(!abilities.activateAbility(p->id, 0, 1, tgts));   // player 1 blocked
+}
+
+TEST(effect_must_block_any) {
+    // Academic Dispute: DB$ Effect | Mode$ MustBlock forces a creature to block.
+    GameState game;
+    auto srcR = makeRules("Academic Dispute", "Sorcery", "", "");
+    srcR.svars["MB"] = "Mode$ MustBlock | ValidCreature$ Card.IsRemembered";
+    mtg::Card* src = game.createCard(&srcR, 0);
+
+    auto cR = makeRules("Blocker", "Creature", "2", "2");
+    mtg::Card* cLib = game.createCard(&cR, 1);
+    mtg::Card* blk = game.moveToZone(cLib->id, mtg::ZoneType::Battlefield, 1);
+
+    mtg::EffectContext ctx{ game, src, static_cast<uint8_t>(0), {}, 0 };
+    ctx.remembered = { blk->id };
+    mtg::executeEffect(mtg::parseScriptLine("DB$ Effect | StaticAbilities$ MB | RememberObjects$ Remembered"), ctx);
+    ASSERT(blk->mustBlockAny);
+}
+
 TEST(plan_counter_threshold) {
     // CounterAdded | Threshold$ 3 fires only once the target reaches 3 counters.
     mtg::GameState game;
@@ -1002,6 +1613,34 @@ int main() {
     RUN(clone_copies_with_overrides);
     RUN(counter_bonus_doc_samson);
     RUN(token_amount_by_trigger_pips);
+    RUN(token_doubler_replacement);
+    RUN(counter_doubler_replacement);
+    RUN(replace_mana_forces_color);
+    RUN(replace_mana_doubles_amount);
+    RUN(change_targets_redirects_spell);
+    RUN(control_spell_changes_controller);
+    RUN(gain_control_variant_to_owner);
+    RUN(gain_control_variant_swap);
+    RUN(change_combatants_makes_attacker);
+    RUN(replace_damage_prevents_combat);
+    RUN(replace_damage_prevents_to_player);
+    RUN(replace_damage_shield_all_but_one);
+    RUN(control_player_sets_marker);
+    RUN(control_player_denies_actions);
+    RUN(impulse_draw_exile_then_play);
+    RUN(temp_unblockable_via_effect);
+    RUN(effect_grants_keyword_until_eot);
+    RUN(effect_cant_block_until_eot);
+    RUN(effect_cant_attack_until_eot);
+    RUN(effect_cant_be_cast_this_turn);
+    RUN(cant_regenerate_overrides_shield);
+    RUN(effect_anthem_pt_until_eot);
+    RUN(effect_cant_gain_life_this_turn);
+    RUN(effect_extra_land_play);
+    RUN(effect_no_max_hand_size);
+    RUN(effect_reduce_cost_this_turn);
+    RUN(effect_cant_activate_abilities);
+    RUN(effect_must_block_any);
     RUN(plan_counter_threshold);
     RUN(clone_roundtrip_preserves_state);
     RUN(charm_picks_best_mode);

@@ -53,6 +53,10 @@ struct Card {
     uint32_t tempKeywords   = 0;
     bool     tempIsCreature = false; // Vehicle crew / Animate effects
 
+    // Keywords removed until end of turn by a Debuff effect ("loses flying until
+    // end of turn"). Cleared and restored into keywordMask at Cleanup.
+    uint32_t tempRemovedKeywords = 0;
+
     // Keyword bitmask built from CardRules::keywords when entering a zone.
     // Can be modified by continuous effects (e.g. "gains Flying until EOT").
     uint32_t keywordMask = 0;
@@ -103,6 +107,32 @@ struct Card {
     // matching this filter. Empty = no such restriction.
     // Set by S:Mode$ CantBlockBy with ValidBlocker$ present.
     std::string blockOnlyBy;
+
+    // "Can't be blocked this turn" granted by a DB$ Effect (Access Tunnel, combat
+    // tricks). Unlike `unblockable`/`blockOnlyBy` (rebuilt each recompute from S:
+    // lines) these survive recomputeStaticBonuses and are cleared at end of turn.
+    bool        tempUnblockable = false;
+    std::string tempBlockOnlyBy;
+
+    // "Can't block this turn" granted by a DB$ Effect (Falter, Barrage of Boulders).
+    // Survives recompute; cleared at end of turn.
+    bool tempCantBlock = false;
+
+    // "Can't attack this turn" granted by a DB$ Effect (Blinding Light, Academic
+    // Probation). Survives recompute; cleared at end of turn.
+    bool tempCantAttack = false;
+
+    // "Can't be regenerated this turn" (Carbonize, Disintegrate, board wipes). The
+    // regeneration shield won't save this creature. Cleared at end of turn.
+    bool tempCantRegenerate = false;
+
+    // "This permanent's activated abilities can't be activated this turn" (Braided
+    // Net). Cleared at end of turn.
+    bool tempCantActivate = false;
+
+    // "Must block this turn if able" — block any attacker (Academic Dispute,
+    // Berserkers' Frenzy). Cleared each Cleanup.
+    bool mustBlockAny = false;
 
     // Remaining damage-prevention shield (set by Healing Salve, etc.; cleared each Cleanup).
     int damageShield = 0;
@@ -166,6 +196,13 @@ struct Card {
 
     // Adventure flag: true when the card is in exile waiting to be cast as its creature face
     bool adventureExiled = false;
+
+    // Impulse draw (Light Up the Stage, Reckless Impulse): this card is in exile and its
+    // controller may play it through end of turn `mayPlayUntilTurn`. Granted by a
+    // DB$ Effect with a MayPlay$ static over the exiled cards.
+    bool    mayPlayFromExile = false;
+    uint8_t mayPlayController = 255;
+    int     mayPlayUntilTurn  = -1;
 
     // Cipher: id of the creature this card is encoded onto (kInvalidId = not encoded).
     // When non-invalid and the creature deals combat damage, you may cast a free copy.

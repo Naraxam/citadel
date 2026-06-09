@@ -242,6 +242,11 @@ private:
     std::deque<PendingTrigger> m_humanTriggers; // triggers awaiting human target input
     int m_triggerDepth = 0;  // recursion guard for drainPendingTriggers
 
+    // Rewrite a spell's targets toward the redirector's opponent (ChangeTargets).
+    // Player targets become that opponent; card targets become the opponent's most
+    // valuable permanent matching the spell's ValidTgts (best for a harmful spell).
+    void redirectSpellTargets(StackAbility& ability, uint8_t redirector);
+
     // Attempt to pay a mana cost from the player's pool.
     // Returns false without modifying the pool if it can't be paid.
     bool payCost(const ManaCost& cost, uint8_t controller);

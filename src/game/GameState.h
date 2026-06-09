@@ -252,6 +252,15 @@ public:
     // Cleared in recomputeStaticBonuses and reset.
     bool cantGainLife[4] = {false, false, false, false};
 
+    // "Can't gain life this turn" from a DB$ Effect (Atarka's Command, Sulfuric Vortex
+    // variants). Recompute-safe (unlike cantGainLife which is rebuilt); cleared at EOT.
+    bool tempCantGainLife[2] = {false, false};
+
+    // "Can't activate non-mana abilities this turn" from a DB$ Effect (Abeyance).
+    // Checked in activateAbility; cleared at EOT. (Per-permanent restrictions like
+    // Braided Net use Card::tempCantActivate instead.)
+    bool tempCantActivate[2] = {false, false};
+
     // CantPlayLand: set by S:Mode$ CantPlayLand. Index = player forbidden from playing lands.
     // Cleared in recomputeStaticBonuses each turn.
     bool cantPlayLand[4] = {false, false, false, false};
@@ -261,9 +270,18 @@ public:
     // Recomputed every recomputeStaticBonuses(). The per-turn limit is 1 + this.
     int extraLandPlays[4] = {0, 0, 0, 0};
 
+    // Extra land plays granted by a DB$ Effect "play an additional land this turn"
+    // (Explore, Summer Bloom). Recompute-safe (extraLandPlays is rebuilt); EOT-cleared.
+    int tempExtraLandPlays[2] = {0, 0};
+
+    // "No maximum hand size" override from a DB$ Effect (-1 = use the player's normal
+    // max). Read at the controller's Cleanup discard; EOT-cleared.
+    int tempMaxHandSize[2] = {-1, -1};
+
     // Land-play limit / eligibility for a player (base 1 + AdjustLandPlays).
     int landPlayLimit(uint8_t pid) const noexcept {
-        return 1 + (pid < 4 ? extraLandPlays[pid] : 0);
+        return 1 + (pid < 4 ? extraLandPlays[pid] : 0)
+                 + (pid < 2 ? tempExtraLandPlays[pid] : 0);
     }
     bool canPlayLand(uint8_t pid) const noexcept {
         if (pid >= 4 || cantPlayLand[pid]) return false;
@@ -282,6 +300,13 @@ public:
     // Used by Card.ChosenColor filter. Cleared by DB$ Cleanup | ClearChosenColor$ True.
     std::string chosenColorName;
 
+    // Pending stack modifications applied when the affected spell resolves (resolveTop).
+    // Keyed by the spell's stack card id. Set by DB$ ChangeTargets / DB$ ControlSpell.
+    //  - pendingRetarget:      value = the redirector's player id (targets aimed at their opponent)
+    //  - pendingControlChange: value = the new controller for the spell
+    std::unordered_map<ObjectId, uint8_t> pendingRetarget;
+    std::unordered_map<ObjectId, uint8_t> pendingControlChange;
+
     // Hint for Count$DamageAmount — the amount from the most recent damage trigger.
     // Set by AbilityProcessor before executing DamageDone trigger effects; cleared after.
     int triggerAmountHint = 0;
@@ -290,7 +315,7 @@ public:
     // Returns false if life gain was prevented by S:Mode$ CantGainLife.
     bool gainLife(uint8_t pid, int amount) noexcept {
         if (amount <= 0) return false;
-        if (cantGainLife[pid]) return false;
+        if (cantGainLife[pid] || tempCantGainLife[pid]) return false;
         m_players[pid].gainLife(amount);
         lifeGainedThisTurn[pid] += amount;
         return true;
@@ -359,6 +384,26 @@ public:
     // Monarch: the player who is currently the Monarch (gains a card at EOT, loses it on combat damage).
     // 255 = no one is the Monarch.
     uint8_t monarchPlayer = 255;
+
+    // ControlPlayer (Mindslaver, Sorin Markov, Worst Fears): turnControllerOf[V] = C
+    // means player C controls player V's next turn (255 = uncontrolled). A controlled
+    // player takes no voluntary actions that turn (enforced in AiPlayer). Consumed at
+    // the controlled player's Cleanup step.
+    uint8_t turnControllerOf[2] = { 255, 255 };
+    bool isTurnControlled(uint8_t pid) const noexcept { return turnControllerOf[pid] != 255; }
+    void setTurnController(uint8_t victim, uint8_t controller) noexcept { turnControllerOf[victim] = controller; }
+    void clearTurnController(uint8_t pid) noexcept { turnControllerOf[pid] = 255; }
+
+    // Temporary "can't cast" restrictions from DB$ Effect (Silence, Abeyance, Azor):
+    // each entry is (restricted player id, ValidCard$ filter). Checked in castSpell;
+    // cleared at end of turn.
+    std::vector<std::pair<uint8_t, std::string>> tempCantCast;
+
+    // Temporary generic-cost reductions from DB$ Effect (Ballad of the Black Flag,
+    // "spells you cast this turn cost less"). Summed by genericReductionFor; cleared
+    // at end of turn. (activator 255 = any; validCard "" = all spells.)
+    struct TempCostMod { uint8_t activator; std::string validCard; int amount; };
+    std::vector<TempCostMod> tempCostMods;
 
     // Active combat state pointer — set by TurnManager while in a combat phase,
     // nullptr otherwise. Allows Effects to remove creatures from combat.

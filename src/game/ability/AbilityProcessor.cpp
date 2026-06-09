@@ -202,14 +202,15 @@ bool AbilityProcessor::activateManaAbility(ObjectId sourceId, uint8_t controller
         char produced = colors[cidx];
 
         source->tapped = true;
-        ManaPool& pool = m_game.player(controller).manaPool();
-        switch (produced) {
-            case 'W': pool.add(ManaCostShard::WHITE); break;
-            case 'U': pool.add(ManaCostShard::BLUE);  break;
-            case 'B': pool.add(ManaCostShard::BLACK);  break;
-            case 'R': pool.add(ManaCostShard::RED);    break;
-            case 'G': pool.add(ManaCostShard::GREEN);  break;
-        }
+        // Route through effectMana so mana-production replacement effects
+        // (Contamination, Infernal Darkness, Mana Reflection) apply to basic lands too.
+        ScriptLine manaScript;
+        manaScript.abilityType = "AB";
+        manaScript.effectType  = "Mana";
+        manaScript.params["Produced"] = std::string(1, produced);
+        manaScript.params["Amount"]   = "1";
+        EffectContext mctx{ m_game, source, controller, {}, 0 };
+        effectMana(manaScript, mctx);
         fireTapsForManaTriggers(*source, controller, m_game);
         return true;
     }
@@ -300,6 +301,15 @@ int AbilityProcessor::genericReductionFor(const Card& spell,
     processLines(spell.rules->staticAbilityLines, &spell, true);
     for (const Card* bf : m_game.battlefield().cards())
         processLines(bf->rules->staticAbilityLines, bf, false);
+
+    // Temporary "spells cost less this turn" reductions from a DB$ Effect.
+    for (const auto& m : m_game.tempCostMods) {
+        if (m.activator != 255 && m.activator != controller) continue;
+        if (!m.validCard.empty() &&
+            !cardMatchesAnyFilter(spell, m.validCard, controller, kInvalidId, nullptr, &m_game))
+            continue;
+        discount += m.amount;
+    }
 
     return discount - surcharge;
 }
@@ -409,6 +419,9 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
     } else if (source->zone == ZoneType::Exile && source->adventureExiled) {
         // Adventure card: cast the creature face from exile after the adventure resolved.
         // Uses normal hand-cast rules from here; adventureExiled flag is cleared on cast.
+    } else if (source->zone == ZoneType::Exile && source->mayPlayFromExile) {
+        // Impulse draw (Light Up the Stage, Reckless Impulse): play the exiled card
+        // using its normal cost from here.
     } else if (source->isCommander && source->zone == ZoneType::Command) {
         // Commander: cast from the command zone; commander tax applied below.
         isFromCommand = true;
@@ -445,6 +458,14 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
             }
             return false; // cast prevented by static ability
         }
+    }
+
+    // Temporary "can't cast" restrictions from a DB$ Effect (Silence, Abeyance, Azor).
+    for (const auto& [pid, filt] : m_game.tempCantCast) {
+        if (pid != controller) continue;
+        if (filt.empty() ||
+            cardMatchesAnyFilter(*source, filt, controller, kInvalidId, nullptr))
+            return false;
     }
 
     // Snapshot rules pointer before zone change destroys this Card object.
@@ -1198,6 +1219,31 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
 
 // ── Stack resolution ──────────────────────────────────────────────────────────
 
+void AbilityProcessor::redirectSpellTargets(StackAbility& ability, uint8_t redirector) {
+    uint8_t opp = redirector ^ 1;  // the player the redirector wants the spell aimed at
+    auto validTgts = std::string(ability.script.get("ValidTgts", ""));
+    Card* source = m_game.findCard(ability.sourceCardId);
+    for (Target& t : ability.targets) {
+        if (t.isPlayer()) {
+            t = Target::forPlayer(opp);
+        } else if (t.isCard()) {
+            // Pick the opponent's most valuable permanent matching the spell's
+            // ValidTgts (sending a harmful spell at their best creature).
+            Card* best = nullptr; int bestScore = -1;
+            for (Card* c : m_game.battlefield().cards()) {
+                if (c->controllerId != opp) continue;
+                if (!validTgts.empty() &&
+                    !cardMatchesAnyFilter(*c, validTgts, redirector, kInvalidId, source, &m_game))
+                    continue;
+                int score = effectivePower(*c) + effectiveToughness(*c);
+                if (score > bestScore) { bestScore = score; best = c; }
+            }
+            if (best) t = Target::forCard(best->id);
+            // else: no legal new target — leave the original (may fizzle naturally)
+        }
+    }
+}
+
 void AbilityProcessor::resolveTop() {
     if (m_stack.empty()) return;
 
@@ -1235,6 +1281,28 @@ void AbilityProcessor::resolveTop() {
         }
     }
 
+    // ControlSpell (Aethersnatch, Commandeer): a prior spell changed who controls
+    // this one. Applied before resolution so a permanent enters under the new
+    // controller and the effect benefits them.
+    if (!m_game.pendingControlChange.empty()) {
+        auto it = m_game.pendingControlChange.find(ability.sourceCardId);
+        if (it != m_game.pendingControlChange.end()) {
+            ability.controllerId = it->second;
+            m_game.pendingControlChange.erase(it);
+        }
+    }
+
+    // ChangeTargets (Deflection, Divert, Bolt Bend …): a prior spell redirected this
+    // one's targets toward the redirector's opponent.
+    if (!m_game.pendingRetarget.empty()) {
+        auto it = m_game.pendingRetarget.find(ability.sourceCardId);
+        if (it != m_game.pendingRetarget.end()) {
+            uint8_t redirector = it->second;
+            m_game.pendingRetarget.erase(it);
+            redirectSpellTargets(ability, redirector);
+        }
+    }
+
     // For spells where X comes from a Count$ SVar (not mana-paid), evaluate it now.
     int xVal = ability.xValue;
     if (xVal == 0 && source) {
@@ -1259,6 +1327,9 @@ void AbilityProcessor::resolveTop() {
                 const Card* tc = m_game.findCard(t.cardId);
                 if (tc && tc->isOnBattlefield()) { hasLegalTarget = true; break; }
                 if (tc && tc->zone == ZoneType::Graveyard) { hasLegalTarget = true; break; }
+                // Spells targeting an object on the stack (Counter, ChangeTargets,
+                // ControlSpell) — a stack object is a legal target.
+                if (tc && tc->zone == ZoneType::Stack) { hasLegalTarget = true; break; }
             }
         }
         if (!hasLegalTarget) {
@@ -2157,6 +2228,10 @@ bool AbilityProcessor::activateAbility(ObjectId sourceId, int abilityIndex,
     if (!source) return false;
     if (source->controllerId != controller) return false;
     if (source->allAbilitiesRemoved) return false; // Humility etc.
+    // CantBeActivated (Abeyance / Braided Net) — non-mana abilities are blocked.
+    // (Mana abilities go through activateManaAbility, which is unaffected.)
+    if ((controller < 2 && m_game.tempCantActivate[controller]) ||
+        source->tempCantActivate) return false;
     // Most abilities require the source to be on the battlefield.
     // Some (like Cycling) declare ActivationZone$ Hand — handled below.
 
