@@ -37,17 +37,24 @@ int toInt(std::string_view sv, int defaultVal = 0) {
     return v;
 }
 
-void addProduced(std::string_view produced, int amount, ManaPool& pool) {
+// `restriction` non-empty (a RestrictValid$ spec) routes the produced mana into
+// the pool's restricted store, where it can only be spent on matching payments.
+void addProduced(std::string_view produced, int amount, ManaPool& pool,
+                 const std::string& restriction = {}, ObjectId producer = kInvalidId) {
+    auto addShard = [&](const ManaCostShard& shard, int n) {
+        if (restriction.empty()) pool.add(shard, n);
+        else                     pool.addRestricted(shard, n, restriction, producer);
+    };
     // Colourless {C} is its OWN mana type — it pays generic costs but NOT
     // coloured pips. Store it as a colourless atom, never as "generic".
     if (produced == "C") {
-        pool.add(ManaCostShard::COLORLESS, amount);
+        addShard(ManaCostShard::COLORLESS, amount);
         return;
     }
     // "Any colour" → a flexible atom carrying all five colour bits, so it can
     // pay any single coloured pip (and counts toward generic). NOT generic mana.
     if (produced == "Any" || produced == "AnyColor") {
-        pool.add(ManaCostShard{ManaAtom::COLORS_MASK, "Any"}, amount);
+        addShard(ManaCostShard{ManaAtom::COLORS_MASK, "Any"}, amount);
         return;
     }
     // "Combo W U G" — flexible atom over just the listed colours (the human
@@ -62,16 +69,16 @@ void addProduced(std::string_view produced, int amount, ManaPool& pool) {
             else if (c == 'G') mask |= ManaAtom::GREEN;
         }
         if (mask == 0) mask = ManaAtom::COLORS_MASK;
-        pool.add(ManaCostShard{mask, "Combo"}, amount);
+        addShard(ManaCostShard{mask, "Combo"}, amount);
         return;
     }
     for (char c : produced) {
         switch (c) {
-            case 'W': pool.add(ManaCostShard::WHITE, amount); break;
-            case 'U': pool.add(ManaCostShard::BLUE,  amount); break;
-            case 'B': pool.add(ManaCostShard::BLACK, amount); break;
-            case 'R': pool.add(ManaCostShard::RED,   amount); break;
-            case 'G': pool.add(ManaCostShard::GREEN, amount); break;
+            case 'W': addShard(ManaCostShard::WHITE, amount); break;
+            case 'U': addShard(ManaCostShard::BLUE,  amount); break;
+            case 'B': addShard(ManaCostShard::BLACK, amount); break;
+            case 'R': addShard(ManaCostShard::RED,   amount); break;
+            case 'G': addShard(ManaCostShard::GREEN, amount); break;
             default:  break; // ignore spaces and other formatting chars
         }
     }
@@ -937,6 +944,12 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
     std::string_view produced = producedStr;
     ManaPool& pool = ctx.game.player(ctx.controller).manaPool();
 
+    // RestrictValid$ (Secluded Courtyard, Cavern of Souls, Pillar of Origins…):
+    // the produced mana may only be spent on matching spells/abilities. Carry the
+    // spec + producing permanent through every production path below.
+    std::string restriction(s.get("RestrictValid", ""));
+    ObjectId    producer = ctx.source ? ctx.source->id : kInvalidId;
+
     // Mana-production replacement effects (Contamination/Infernal Darkness force a
     // colour; Mana Reflection doubles; Chaos Moon forces colourless). The producing
     // permanent is ctx.source.
@@ -987,12 +1000,12 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
         if (colors.empty()) { pool.addGeneric(amount); return; }
         // Single-colour Combo is no choice at all — fast-path: produce it.
         if (colors.size() == 1) {
-            addProduced(std::string(1, colors[0]), amount, pool);
+            addProduced(std::string(1, colors[0]), amount, pool, restriction, producer);
             return;
         }
 
         if (ctx.controller == 0 && ctx.game.isHumanInteractive()) {
-            ctx.game.setPendingManaChoice(0, colors, amount);
+            ctx.game.setPendingManaChoice(0, colors, amount, restriction, producer);
             return;
         }
 
@@ -1022,11 +1035,11 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
             int i = idxOf(c);
             if (i >= 0 && demand[i] > best) { best = demand[i]; pick = c; }
         }
-        addProduced(std::string(1, pick), amount, pool);
+        addProduced(std::string(1, pick), amount, pool, restriction, producer);
         return;
     }
 
-    addProduced(produced, amount, pool);
+    addProduced(produced, amount, pool, restriction, producer);
 }
 
 // ManaReflected — "add one mana of any type that <source> produced" (Barbflare

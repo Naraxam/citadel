@@ -49,4 +49,21 @@ bool cardMatchesAnyFilter(const Card& c, std::string_view filter,
                           const GameState* game = nullptr,
                           const std::vector<ObjectId>* remembered = nullptr) noexcept;
 
+// Evaluate a RestrictValid$ mana-spend spec (the clause on AB$ Mana lines such as
+// Secluded Courtyard / Cavern of Souls / Pillar of Origins). Restricted mana may
+// only pay for things matching the spec. The spec is a comma-separated list of
+// context-gated sub-filters, e.g.:
+//   "Spell.Creature+ChosenType,Activated.Creature+ChosenType+inZoneBattlefield"
+// The leading token gates the context (Spell = casting a spell, Activated =
+// activating an ability; Triggered/Static are not modelled for a mana spend); the
+// remaining '+'-joined tokens form a card filter the payee must satisfy.
+//   payee       — the spell card (isSpell) or the ability's source (isActivated)
+//   producer    — the mana-producing permanent (resolves ChosenType); may be null
+// Returns true if restricted mana with this spec may be spent on `payee`.
+bool manaRestrictionAllows(std::string_view spec, const Card& payee,
+                           bool isSpell, bool isActivated,
+                           uint8_t activeController,
+                           const Card* producer = nullptr,
+                           const GameState* game = nullptr) noexcept;
+
 } // namespace mtg

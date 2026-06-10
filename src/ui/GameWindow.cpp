@@ -4966,7 +4966,12 @@ void GameWindow::completeManaChoice(char color) {
         case 'G': sh = ManaCostShard::GREEN; break;
         default: pool.addGeneric(choice.amount); return;
     }
-    pool.add(sh, choice.amount);
+    // A RestrictValid$ ability (Secluded Courtyard, Cavern of Souls…) makes the
+    // chosen colour restricted — spendable only on matching spells/abilities.
+    if (!choice.restriction.empty())
+        pool.addRestricted(sh, choice.amount, choice.restriction, choice.producerId);
+    else
+        pool.add(sh, choice.amount);
 }
 
 void GameWindow::completeChooseType(const std::string& type) {

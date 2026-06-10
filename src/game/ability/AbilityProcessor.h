@@ -250,6 +250,11 @@ private:
     // Attempt to pay a mana cost from the player's pool.
     // Returns false without modifying the pool if it can't be paid.
     bool payCost(const ManaCost& cost, uint8_t controller);
+    // Context-aware: lets restricted mana (RestrictValid$ producers like Secluded
+    // Courtyard) pay when `payee` satisfies the restriction. `isSpell` = paying a
+    // spell's cast cost; `isActivated` = paying an activated ability's cost.
+    bool payCost(const ManaCost& cost, uint8_t controller,
+                 const Card* payee, bool isSpell, bool isActivated);
 
     // After a non-permanent spell resolves, move its card to the graveyard.
     void moveResolvedSpellToGraveyard(ObjectId cardId, uint8_t ownerId);

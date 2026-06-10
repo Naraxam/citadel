@@ -416,7 +416,7 @@ void AiPlayer::tapAllMana() {
 // Effect: Shivan Reef gets line 0 ({C}, no extra cost) for generic; line 1
 // (Combo U/R + 1 damage) only when the cost has a {U} or {R} requirement.
 int AiPlayer::pickManaLineFor(const Card& src, uint8_t neededColors,
-                                bool genericOk) const {
+                                bool genericOk, const Card* spell) const {
     if (!src.rules) return -1;
     int bestIdx   = -1;
     int bestScore = INT_MIN;
@@ -424,6 +424,18 @@ int AiPlayer::pickManaLineFor(const Card& src, uint8_t neededColors,
     for (const auto& raw : src.rules->abilityLines) {
         auto s = parseScriptLine(raw);
         if (s.abilityType != "AB" || s.effectType != "Mana") continue;
+
+        // RestrictValid lines (Secluded Courtyard's "any colour") yield mana that
+        // can only pay for matching spells/abilities. Without a matching spell in
+        // hand, tapping such a line strands the mana — so make it a last resort.
+        // When `spell` matches, leave it un-penalised so it's available for it.
+        std::string restrict_(s.get("RestrictValid", ""));
+        bool restrictedUnusable = false;
+        if (!restrict_.empty()) {
+            bool usable = spell && manaRestrictionAllows(restrict_, *spell,
+                              /*isSpell=*/true, /*isActivated=*/false, m_id, &src, &m_game);
+            restrictedUnusable = !usable;
+        }
 
         // Extract producible colour letters (handles "Combo W U" too).
         auto prod = std::string(s.get("Produced", "C"));
@@ -436,6 +448,7 @@ int AiPlayer::pickManaLineFor(const Card& src, uint8_t neededColors,
                 colors += ch;
 
         int score = 0;
+        if (restrictedUnusable) score -= 1000;
         for (char ch : colors) {
             uint8_t bit = 0;
             switch (ch) {
@@ -596,50 +609,79 @@ bool AiPlayer::canAfford(const ManaCost& cost) const {
     return me().manaPool().canPay(cost);
 }
 
-bool AiPlayer::canAffordWithUntapped(const ManaCost& cost) const {
+bool AiPlayer::canAffordWithUntapped(const ManaCost& cost, const Card* spell) const {
     if (cost.isNoCost()) return true;
-    // X-cost: always castable with X=0 if fixed portion is affordable
+
+    // Colours a land's RestrictValid mana line can supply toward casting `spell`
+    // (0 if it has no such line, or none usable for this spell). Lets the planner
+    // count e.g. Secluded Courtyard's "any colour" toward a matching creature.
+    auto restrictedColorMask = [&](const Card& c) -> uint8_t {
+        if (!spell || !c.rules) return 0;
+        uint8_t mask = 0;
+        for (const auto& raw : c.rules->abilityLines) {
+            auto s = parseScriptLine(raw);
+            if (s.abilityType != "AB" || s.effectType != "Mana") continue;
+            std::string rv(s.get("RestrictValid", ""));
+            if (rv.empty()) continue;
+            if (!manaRestrictionAllows(rv, *spell, /*isSpell=*/true, /*isActivated=*/false,
+                                       m_id, &c, &m_game)) continue;
+            auto prod = std::string(s.get("Produced", "C"));
+            if (prod == "Any" || prod == "AnyColor") return ManaAtom::COLORS_MASK;
+            if (prod.size() > 6 && prod.substr(0, 6) == "Combo ") prod = prod.substr(6);
+            for (char ch : prod)
+                switch (ch) {
+                    case 'W': mask |= ManaAtom::WHITE; break;
+                    case 'U': mask |= ManaAtom::BLUE;  break;
+                    case 'B': mask |= ManaAtom::BLACK; break;
+                    case 'R': mask |= ManaAtom::RED;   break;
+                    case 'G': mask |= ManaAtom::GREEN; break;
+                }
+        }
+        return mask;
+    };
+    // One mana from land `c`, restriction-aware: a usable restricted line yields a
+    // flexible colour shard; otherwise the basic-subtype colour, else generic.
+    auto addLandMana = [&](ManaPool& sim, const Card& c) {
+        if (uint8_t rm = restrictedColorMask(c)) {
+            sim.add(ManaCostShard{rm, "Any"}, 1);
+            return;
+        }
+        uint8_t lc = 0;
+        const auto& sub = c.rules->type;
+        if      (sub.hasSubtype("Forest"))   lc = ManaAtom::GREEN;
+        else if (sub.hasSubtype("Island"))   lc = ManaAtom::BLUE;
+        else if (sub.hasSubtype("Mountain")) lc = ManaAtom::RED;
+        else if (sub.hasSubtype("Plains"))   lc = ManaAtom::WHITE;
+        else if (sub.hasSubtype("Swamp"))    lc = ManaAtom::BLACK;
+        if (lc) sim.add(ManaCostShard::fromAtoms(lc), 1);
+        else    sim.addGeneric(1);  // non-basic: treat as generic for planning
+    };
+    // Floating restricted mana counts toward `spell` only if it matches.
+    ManaUsePredicate pred = [&](const RestrictedMana& rm) {
+        return spell && manaRestrictionAllows(rm.restriction, *spell, true, false, m_id,
+                                              m_game.findCard(rm.producerId), &m_game);
+    };
+
+    // X-cost: castable with X=0 if the fixed portion is affordable.
     if (cost.hasX()) {
-        // Create a zero-X version: just check generic + colored shards (X portion = 0)
         ManaPool simPool = me().manaPool();
         for (const Card* c : m_game.battlefield().cards()) {
             if (c->controllerId != m_id || c->tapped || !c->rules->type.isLand()) continue;
-            uint8_t lc = 0;
-            const auto& sub = c->rules->type;
-            if      (sub.hasSubtype("Forest"))   lc = ManaAtom::GREEN;
-            else if (sub.hasSubtype("Island"))   lc = ManaAtom::BLUE;
-            else if (sub.hasSubtype("Mountain")) lc = ManaAtom::RED;
-            else if (sub.hasSubtype("Plains"))   lc = ManaAtom::WHITE;
-            else if (sub.hasSubtype("Swamp"))    lc = ManaAtom::BLACK;
-            if (lc) simPool.add(ManaCostShard::fromAtoms(lc), 1);
-            else    simPool.addGeneric(1);
+            addLandMana(simPool, *c);
         }
-        // Build fixed cost (remove X shards)
         int fixedCmc = cost.genericAmount();
         for (const auto& s : cost.shards())
             if (!s.isX()) fixedCmc += s.cmc();
         return simPool.total() >= fixedCmc;
     }
-    // Simulate tapping all untapped lands and check
+    // Simulate tapping all untapped lands and check.
     ManaPool simPool = me().manaPool();
     for (const Card* c : m_game.battlefield().cards()) {
         if (c->controllerId != m_id || c->tapped) continue;
         if (!c->rules->type.isLand()) continue;
-        // Determine what color this land produces (basic land heuristic)
-        uint8_t landColor = 0;
-        const auto& sub = c->rules->type;
-        if      (sub.hasSubtype("Forest"))   landColor = ManaAtom::GREEN;
-        else if (sub.hasSubtype("Island"))   landColor = ManaAtom::BLUE;
-        else if (sub.hasSubtype("Mountain")) landColor = ManaAtom::RED;
-        else if (sub.hasSubtype("Plains"))   landColor = ManaAtom::WHITE;
-        else if (sub.hasSubtype("Swamp"))    landColor = ManaAtom::BLACK;
-        if (landColor)
-            simPool.add(ManaCostShard::fromAtoms(landColor), 1);
-        else
-            simPool.addGeneric(1);  // non-basic: treat as generic for planning
+        addLandMana(simPool, *c);
     }
-    if (cost.hasX()) return simPool.total() >= cost.cmc();
-    return simPool.canPay(cost);
+    return simPool.canPay(cost, pred);
 }
 
 void AiPlayer::tapForCost(int neededTotal) {
@@ -656,9 +698,17 @@ void AiPlayer::tapForCost(int neededTotal) {
 // Per-source: pick which AB$ Mana line to fire based on what's still needed —
 // so Shivan Reef contributes {C} for a generic-only cost (no life paid) and
 // only flips to its colored Combo line when {U} or {R} is actually required.
-void AiPlayer::tapForManaCost(const ManaCost& cost) {
+void AiPlayer::tapForManaCost(const ManaCost& cost, const Card* spell) {
     ManaPool& pool = me().manaPool();
-    if (pool.canPay(cost)) return;  // already have enough
+    // When paying for a specific creature/spell, restricted mana (already floating
+    // or tapped below) counts toward it if it matches the producer's clause.
+    ManaUsePredicate pred = [&](const RestrictedMana& rm) {
+        return spell && manaRestrictionAllows(rm.restriction, *spell,
+                            /*isSpell=*/true, /*isActivated=*/false, m_id,
+                            m_game.findCard(rm.producerId), &m_game);
+    };
+    auto havePaid = [&]{ return pool.canPay(cost, pred); };
+    if (havePaid()) return;  // already have enough
 
     auto colorOfLand = [](const Card& c) -> uint8_t {
         const auto& sub = c.rules->type;
@@ -674,11 +724,11 @@ void AiPlayer::tapForManaCost(const ManaCost& cost) {
     uint8_t needed = cost.colorIdentity();
     if (needed) {
         for (Card* c : m_game.battlefield().cards()) {
-            if (pool.canPay(cost)) break;
+            if (havePaid()) break;
             if (c->controllerId != m_id || c->tapped || !c->rules->type.isLand()) continue;
             // For multi-line sources (Shivan Reef etc.) ask the picker; for
             // single-line basic lands a subtype check is faster.
-            int idx = pickManaLineFor(*c, needed, /*genericOk=*/false);
+            int idx = pickManaLineFor(*c, needed, /*genericOk=*/false, spell);
             bool willHelp = false;
             if (idx >= 0) {
                 // Score > 0 means the line produces something we need.
@@ -716,9 +766,9 @@ void AiPlayer::tapForManaCost(const ManaCost& cost) {
     }
     // Pass 2: pad out generic with the cheapest line (no life paid for {C}).
     for (Card* c : m_game.battlefield().cards()) {
-        if (pool.canPay(cost)) break;
+        if (havePaid()) break;
         if (c->controllerId != m_id || c->tapped || !c->rules->type.isLand()) continue;
-        int idx = pickManaLineFor(*c, /*neededColors=*/0, /*genericOk=*/true);
+        int idx = pickManaLineFor(*c, /*neededColors=*/0, /*genericOk=*/true, spell);
         m_abilities.activateManaAbility(c->id, m_id, idx);
     }
 }
@@ -1168,7 +1218,7 @@ bool AiPlayer::tryCastInstant() {
         ManaPool poolBefore = me().manaPool();
         int      lifeBefore = me().life();
 
-        tapForManaCost(cand.rules->manaCost);
+        tapForManaCost(cand.rules->manaCost, m_game.findCard(cand.id));
         if (m_abilities.castSpell(cand.id, m_id, cand.targets)) {
             AIOUT << "  [" << me().name() << "] responds with " << spellName << '\n';
             return true;
@@ -1595,22 +1645,22 @@ bool AiPlayer::tryCastBestSpell() {
         if (c->rules->type.isLand()) continue;
         // Determine the cheapest affordable cost (base, Dash, Blitz, Evoke, Surge, Spectacle, Miracle)
         const ManaCost* effCost = &c->rules->manaCost;
-        if (!canAffordWithUntapped(*effCost)) {
-            if (c->rules->hasDash    && canAffordWithUntapped(c->rules->dashCost))
+        if (!canAffordWithUntapped(*effCost, c)) {
+            if (c->rules->hasDash    && canAffordWithUntapped(c->rules->dashCost, c))
                 effCost = &c->rules->dashCost;
-            else if (c->rules->hasBlitz  && canAffordWithUntapped(c->rules->blitzCost))
+            else if (c->rules->hasBlitz  && canAffordWithUntapped(c->rules->blitzCost, c))
                 effCost = &c->rules->blitzCost;
-            else if (c->rules->hasEvoke  && canAffordWithUntapped(c->rules->evokeCost))
+            else if (c->rules->hasEvoke  && canAffordWithUntapped(c->rules->evokeCost, c))
                 effCost = &c->rules->evokeCost;
             else if (c->rules->hasSurge  && m_game.spellsCastThisTurn > 0 &&
-                     canAffordWithUntapped(c->rules->surgeCost))
+                     canAffordWithUntapped(c->rules->surgeCost, c))
                 effCost = &c->rules->surgeCost;
             else if (c->rules->hasSpectacle &&
                      m_game.playerDamagedThisTurn[primaryOpponentId()] &&
-                     canAffordWithUntapped(c->rules->spectacleCost))
+                     canAffordWithUntapped(c->rules->spectacleCost, c))
                 effCost = &c->rules->spectacleCost;
             else if (c->rules->hasMiracle && c->miracleEligible &&
-                     canAffordWithUntapped(c->rules->miracleCost))
+                     canAffordWithUntapped(c->rules->miracleCost, c))
                 effCost = &c->rules->miracleCost;
             else
                 continue;
@@ -1623,14 +1673,14 @@ bool AiPlayer::tryCastBestSpell() {
     // Graveyard cards with Flashback, Retrace, or Unearth
     for (Card* c : me().graveyard().cards()) {
         const ManaCost* cost = nullptr;
-        if (c->rules->hasFlashback && canAffordWithUntapped(c->rules->flashbackCost))
+        if (c->rules->hasFlashback && canAffordWithUntapped(c->rules->flashbackCost, c))
             cost = &c->rules->flashbackCost;
-        else if (c->rules->hasRetrace && canAffordWithUntapped(c->rules->manaCost)) {
+        else if (c->rules->hasRetrace && canAffordWithUntapped(c->rules->manaCost, c)) {
             bool hasLand = false;
             for (const Card* h : me().hand().cards()) if (h->isLand()) { hasLand = true; break; }
             if (hasLand) cost = &c->rules->manaCost;
         } else if (c->rules->hasUnearth && c->rules->type.isCreature() &&
-                   canAffordWithUntapped(c->rules->unearthCost))
+                   canAffordWithUntapped(c->rules->unearthCost, c))
             cost = &c->rules->unearthCost;
         if (!cost) continue;
         auto tgts = pickTargets(*c->rules);
@@ -1724,7 +1774,7 @@ bool AiPlayer::tryCastBestSpell() {
             bool canReserve = (instantReserve > 0) &&
                               (totalLands >= cand.tapCmc + instantReserve);
             if (!canReserve)
-                tapForManaCost(*cand.costPtr);
+                tapForManaCost(*cand.costPtr, m_game.findCard(cand.id));
             else
                 tapForCostReserving(cand.tapCmc, instantReserve);
         } else {

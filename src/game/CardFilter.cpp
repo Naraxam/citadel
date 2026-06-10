@@ -482,4 +482,64 @@ bool cardMatchesAnyFilter(const Card& c, std::string_view filter,
     return false;
 }
 
+bool manaRestrictionAllows(std::string_view spec, const Card& payee,
+                           bool isSpell, bool isActivated,
+                           uint8_t activeController,
+                           const Card* producer,
+                           const GameState* game) noexcept {
+    if (spec.empty()) return true;
+
+    // CardFilter requires a primary TYPE token, then qualifiers. RestrictValid
+    // tokens after the context gate are a flat '+'-joined predicate set that may
+    // lead with a type (Creature, Instant…) OR a bare property (Legendary,
+    // ChosenType, MultiColor…). Pick a real type if one is present, else "Card",
+    // and move the remaining tokens to qualifiers so they're matched correctly.
+    auto isTypeTok = [](std::string_view t) {
+        return t == "Creature" || t == "Artifact" || t == "Enchantment" ||
+               t == "Land"     || t == "Planeswalker" || t == "Permanent" ||
+               t == "Instant"  || t == "Sorcery" || t == "Battle" ||
+               t == "Card"     || t == "Any";
+    };
+
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        size_t comma = spec.find(',', pos);
+        std::string_view sub = spec.substr(pos, comma == std::string_view::npos
+                                                ? std::string_view::npos : comma - pos);
+        pos = (comma == std::string_view::npos) ? spec.size() + 1 : comma + 1;
+        if (sub.empty()) continue;
+
+        size_t dot = sub.find('.');
+        std::string_view lead = sub.substr(0, dot == std::string_view::npos ? sub.size() : dot);
+        std::string_view rest = (dot == std::string_view::npos)
+                                ? std::string_view{} : sub.substr(dot + 1);
+
+        // Context gate. If the lead token isn't a gate, the whole sub is the filter.
+        if      (lead == "Spell")     { if (!isSpell)     continue; }
+        else if (lead == "Activated") { if (!isActivated) continue; }
+        else if (lead == "Triggered" || lead == "Static") { continue; }  // not a mana spend
+        else { rest = sub; }   // un-gated: filter is the entire sub
+
+        // Build "Type" or "Type.q1+q2" from the '+'-joined tokens in `rest`.
+        std::string typeTok = "Card";
+        std::string quals;
+        bool tookType = false;
+        size_t tp = 0;
+        while (tp <= rest.size()) {
+            size_t plus = rest.find('+', tp);
+            std::string_view tok = rest.substr(tp, plus == std::string_view::npos
+                                                   ? std::string_view::npos : plus - tp);
+            tp = (plus == std::string_view::npos) ? rest.size() + 1 : plus + 1;
+            if (tok.empty()) continue;
+            if (!tookType && isTypeTok(tok)) { typeTok = std::string(tok); tookType = true; }
+            else { if (!quals.empty()) quals += '+'; quals += std::string(tok); }
+        }
+        std::string filter = quals.empty() ? typeTok : (typeTok + '.' + quals);
+
+        if (cardMatchesFilter(payee, filter, activeController, kInvalidId, producer, game))
+            return true;
+    }
+    return false;
+}
+
 } // namespace mtg

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace mtg { class CardDb; }
@@ -35,13 +36,20 @@ private:
 
     std::vector<std::filesystem::path> m_decks;
     std::vector<std::string>           m_deckNames;
-    // Lower-case full text of each .dck file, cached at scan time so the
-    // filter can scan in-memory instead of re-reading 200+ files per keystroke.
-    std::vector<std::string>           m_deckBodyLower;
-    // Per-deck colour identity (WUBRG bits, from the commander[s]) + whether we
-    // could resolve it. Computed once at scan time for the colour filter.
-    std::vector<uint8_t>               m_deckCI;
-    std::vector<char>                  m_deckCIKnown;
+    // Per-deck metadata used only by the filter (text search + colour pips).
+    // These are populated LAZILY — scanDecks() only enumerates paths/names and
+    // reads no file contents, so opening the screen with thousands of decks is
+    // instant. The first filter that actually needs a deck's body/colour reads
+    // that file exactly once (deriving both at once) and caches the result via
+    // m_deckMetaLoaded. Mutable so the lazy fill can run from const callers.
+    mutable std::vector<std::string>   m_deckBodyLower;  // lower-case file text + filename
+    mutable std::vector<uint8_t>       m_deckCI;         // WUBRG bits from commander(s)
+    mutable std::vector<char>          m_deckCIKnown;    // 1 if a commander resolved
+    mutable std::vector<char>          m_deckMetaLoaded; // 1 once the above are filled
+
+    // Read deck i's file once (if not already) and fill m_deckBodyLower /
+    // m_deckCI / m_deckCIKnown. No-op when already loaded.
+    void ensureMeta(int i) const;
 
     // Colour-identity filter pips: W U B R G + colourless. Empty = no filter.
     std::array<bool, 6> m_colorFilter{};
@@ -124,6 +132,9 @@ public:
     // Combined colour identity (WUBRG bits) of a deck's commander(s); sets
     // `known` false if no commander could be resolved against the CardDb.
     uint8_t deckColorIdentity(const std::filesystem::path& deck, bool& known) const;
+    // Same, but from already-read .dck text — avoids a second file open when the
+    // caller has the body in hand (see ensureMeta).
+    uint8_t deckColorIdentityFromText(std::string_view text, bool& known) const;
     int  hitPlayerCount(float px, float py) const;  // 0=none, 1=2P, 2=3P, 3=4P
 
     void drawPanel (sf::RenderTarget&, const std::string& title,

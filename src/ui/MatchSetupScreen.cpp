@@ -67,6 +67,9 @@ void MatchSetupScreen::scanDecks() {
     m_decks.clear();
     m_deckNames.clear();
     m_deckBodyLower.clear();
+    m_deckCI.clear();
+    m_deckCIKnown.clear();
+    m_deckMetaLoaded.clear();
 
     auto scanDir = [&](const fs::path& dir) {
         if (dir.empty() || !fs::exists(dir)) return;
@@ -89,46 +92,74 @@ void MatchSetupScreen::scanDecks() {
             std::string s = p.stem().string();
             return (s.size() >= 2 && s[0] == 'A' && s[1] == '-');
         }), m_decks.end());
+
+    // Names are cheap (no I/O). Everything else is filled lazily by ensureMeta()
+    // the first time a filter needs it — so a folder with thousands of decks
+    // opens instantly instead of reading every file on the UI thread.
     m_deckNames.reserve(m_decks.size());
-    m_deckBodyLower.reserve(m_decks.size());
-    m_deckCI.reserve(m_decks.size());
-    m_deckCIKnown.reserve(m_decks.size());
-    for (auto& p : m_decks) {
+    for (auto& p : m_decks)
         m_deckNames.push_back(p.stem().string());
-
-        // Slurp the file once so per-keystroke filtering stays in memory.
-        // (~210 decks × ~2 KB ≈ 0.5 MB — trivial.)
-        std::ifstream f(p, std::ios::binary);
-        std::ostringstream ss; ss << f.rdbuf();
-        std::string body = ss.str();
-        // Append the filename (lower-cased) so name matches go through the
-        // same code path as card-content matches.
-        body += "\n";
-        body += p.stem().string();
-        ascii_lower(body);
-        m_deckBodyLower.push_back(std::move(body));
-
-        bool known = false;
-        uint8_t ci = deckColorIdentity(p, known);
-        m_deckCI.push_back(ci);
-        m_deckCIKnown.push_back(known ? 1 : 0);
-    }
+    m_deckBodyLower.assign(m_decks.size(), std::string{});
+    m_deckCI.assign(m_decks.size(), 0);
+    m_deckCIKnown.assign(m_decks.size(), 0);
+    m_deckMetaLoaded.assign(m_decks.size(), 0);
 
     rebuildFilter();
 }
 
+// Read deck i's file exactly once and derive BOTH the lower-cased search body
+// (file text + filename) and the commander colour identity from that single
+// read. Subsequent calls are no-ops. Called on demand from the filter so the
+// default (unfiltered) view never touches the disk.
+void MatchSetupScreen::ensureMeta(int i) const {
+    if (i < 0 || i >= (int)m_decks.size() || m_deckMetaLoaded[i]) return;
+
+    std::ifstream f(m_decks[i], std::ios::binary);
+    std::ostringstream ss; ss << f.rdbuf();
+    std::string body = ss.str();
+
+    // Colour identity needs the ORIGINAL-case card names (CardDb::find is
+    // case-sensitive), so compute it before lower-casing the body.
+    bool known = false;
+    m_deckCI[i]      = deckColorIdentityFromText(body, known);
+    m_deckCIKnown[i] = known ? 1 : 0;
+
+    // Append the filename (so name matches share the substring code path), then
+    // lower-case the whole thing for the search index.
+    body += '\n';
+    body += m_decks[i].stem().string();
+    ascii_lower(body);
+    m_deckBodyLower[i] = std::move(body);
+
+    m_deckMetaLoaded[i] = 1;
+}
+
 uint8_t MatchSetupScreen::deckColorIdentity(const fs::path& deck, bool& known) const {
+    known = false;
+    if (!m_db) return 0;
+    std::ifstream f(deck, std::ios::binary);
+    if (!f) return 0;
+    std::ostringstream ss; ss << f.rdbuf();
+    return deckColorIdentityFromText(ss.str(), known);
+}
+
+uint8_t MatchSetupScreen::deckColorIdentityFromText(std::string_view text,
+                                                    bool& known) const {
     known = false;
     uint8_t ci = 0;
     if (!m_db) return 0;
-    std::ifstream f(deck);
-    if (!f) return 0;
-    std::string line;
     bool inCmd = false;
-    while (std::getline(f, line)) {
+    // Walk the text line by line without copying the whole thing into a stream.
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string_view line = text.substr(pos, nl == std::string_view::npos
+                                                  ? std::string_view::npos : nl - pos);
+        pos = (nl == std::string_view::npos) ? text.size() + 1 : nl + 1;
+
         while (!line.empty() && (line.back() == '\r' || line.back() == ' ' ||
                                   line.back() == '\t'))
-            line.pop_back();
+            line.remove_suffix(1);
         if (line.empty()) continue;
         if (line.front() == '[') {
             std::string lc;
@@ -139,11 +170,11 @@ uint8_t MatchSetupScreen::deckColorIdentity(const fs::path& deck, bool& known) c
         if (!inCmd) continue;
         // "1 Name|SET|num" → "Name"
         auto sp = line.find(' ');
-        std::string name = (sp == std::string::npos) ? line : line.substr(sp + 1);
+        std::string_view name = (sp == std::string_view::npos) ? line : line.substr(sp + 1);
         auto pipe = name.find('|');
-        if (pipe != std::string::npos) name = name.substr(0, pipe);
+        if (pipe != std::string_view::npos) name = name.substr(0, pipe);
         while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
-            name.pop_back();
+            name.remove_suffix(1);
         if (const mtg::CardRules* r = m_db->find(name)) {
             ci |= r->manaCost.colorIdentity();
             known = true;
@@ -168,7 +199,11 @@ void MatchSetupScreen::rebuildFilter() {
         m_visible[side].reserve(m_decks.size());
         std::string needle = m_filter[side];
         ascii_lower(needle);
+        // Deck metadata (body text + colour identity) is only needed when a
+        // filter is actually active; otherwise we skip all file reads entirely.
+        const bool needMeta = !needle.empty() || anyColor;
         for (int i = 0; i < (int)m_decks.size(); ++i) {
+            if (needMeta) ensureMeta(i);
             if (!needle.empty() && m_deckBodyLower[i].find(needle) == std::string::npos)
                 continue;
             if (anyColor && m_deckCIKnown[i]) {
@@ -650,6 +685,9 @@ void MatchSetupScreen::drawPanel(sf::RenderTarget& t, const std::string& title,
         sep2.setFillColor(sf::Color(240, 220, 180, 15));
         t.draw(sep2);
         // Colour-identity pips at the right edge (before the scrollbar).
+        // Metadata is lazy: load just this on-screen row's colour identity
+        // (≤ VISIBLE reads per panel) so pips still show without a filter.
+        ensureMeta(deckIdx);
         if (deckIdx < (int)m_deckCIKnown.size() && m_deckCIKnown[deckIdx]) {
             uint8_t ci = static_cast<uint8_t>(m_deckCI[deckIdx] & mtg::ManaAtom::COLORS_MASK);
             int pips = 0; for (uint8_t v = ci; v; v &= v - 1) ++pips;

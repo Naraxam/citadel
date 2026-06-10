@@ -198,19 +198,24 @@ private:
     bool canAfford(const ManaCost& cost) const;
     // True when (manaPool + untapped land count) >= cost.cmc().
     // Used by tryCastInstant() to avoid calling tapAllMana() unnecessarily.
-    bool canAffordWithUntapped(const ManaCost& cost) const;
+    // `spell` (optional) is the creature/spell being paid for, so restricted-mana
+    // producers (Secluded Courtyard…) count their colours only when the spell
+    // actually matches their RestrictValid clause.
+    bool canAffordWithUntapped(const ManaCost& cost, const mtg::Card* spell = nullptr) const;
     // Tap just enough mana sources to reach neededTotal in the pool.
     void tapForCost(int neededTotal);
     // Color-aware: tap colored lands first, then generics, to satisfy the cost.
-    void tapForManaCost(const ManaCost& cost);
+    // `spell` lets restricted-mana lines be tapped (and counted) for a match.
+    void tapForManaCost(const ManaCost& cost, const mtg::Card* spell = nullptr);
     // Like tapForCost but leaves reserveCmc lands untapped (hold-up for instants).
     void tapForCostReserving(int neededTotal, int reserveCmc);
     // Returns CMC of cheapest instant/flash in hand, 0 if none.
     int  bestInstantCmcInHand() const;
     // Pick which AB$ Mana line on a multi-line source to fire given the
-    // current colored needs. See AiPlayer.cpp for the scoring rules.
+    // current colored needs. See AiPlayer.cpp for the scoring rules. `spell`
+    // makes a RestrictValid line attractive only when the spell matches it.
     int  pickManaLineFor(const mtg::Card& src, uint8_t neededColors,
-                          bool genericOk) const;
+                          bool genericOk, const mtg::Card* spell = nullptr) const;
 
     // ── Combo execution ──────────────────────────────────────────────────
     // Try to execute a detected combo. Returns true if at least one step fired.

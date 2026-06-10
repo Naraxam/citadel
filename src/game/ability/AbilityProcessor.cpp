@@ -938,7 +938,10 @@ bool AbilityProcessor::castSpell(ObjectId cardId, uint8_t controller,
         xVal = available - fixedCmc;
     }
 
-    if (!payCost(effectiveCost, controller)) return false;
+    // Pass the spell card as the payee so restricted mana (e.g. Secluded
+    // Courtyard's "any colour") can pay only when this is a matching creature spell.
+    if (!payCost(effectiveCost, controller, source, /*isSpell=*/true, /*isActivated=*/false))
+        return false;
 
     // Pay the X portion (drain all remaining mana)
     if (xVal > 0) {
@@ -2032,6 +2035,11 @@ bool AbilityProcessor::activateCompanion(uint8_t pid) {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 bool AbilityProcessor::payCost(const ManaCost& cost, uint8_t controller) {
+    return payCost(cost, controller, nullptr, false, false);
+}
+
+bool AbilityProcessor::payCost(const ManaCost& cost, uint8_t controller,
+                               const Card* payee, bool isSpell, bool isActivated) {
     if (cost.isNoCost()) return true;
     ManaPool& pool = m_game.player(controller).manaPool();
 
@@ -2059,12 +2067,17 @@ bool AbilityProcessor::payCost(const ManaCost& cost, uint8_t controller) {
         }
     }
 
-    // Build a non-phyrexian version of the cost for pool.canPay/pay
-    // (phyrexian shards were handled above — skip them here)
-    // For simplicity, build a ManaCost from remaining shards
-    // Use the pool's color-aware payment for everything else.
-    if (!pool.canPay(cost)) return false;
-    pool.pay(cost);
+    // Restricted mana (Secluded Courtyard, Cavern of Souls…) is spendable only
+    // when the thing being paid for satisfies its RestrictValid clause. With no
+    // payee (alternative/additional costs, abilities that aren't creature-typed)
+    // the predicate is false, so restricted mana stays untouched.
+    ManaUsePredicate canUseRestricted = [&](const RestrictedMana& rm) {
+        return payee && manaRestrictionAllows(rm.restriction, *payee, isSpell,
+                                              isActivated, controller,
+                                              m_game.findCard(rm.producerId), &m_game);
+    };
+    if (!pool.canPay(cost, canUseRestricted)) return false;
+    pool.pay(cost, canUseRestricted);
     return true;
 }
 
@@ -2177,10 +2190,13 @@ bool AbilityProcessor::payActivationCost(const std::string& costStr,
         }
     }
 
-    // Pay mana cost if any mana tokens were found
+    // Pay mana cost if any mana tokens were found. The source permanent is the
+    // payee so restricted mana usable for "activate an ability of a creature of
+    // the chosen type" (Secluded Courtyard) can apply when source matches.
     if (!manaCostTokens.empty()) {
         ManaCost cost = ManaCost::parse(manaCostTokens);
-        if (!payCost(cost, controller)) return false;
+        if (!payCost(cost, controller, &source, /*isSpell=*/false, /*isActivated=*/true))
+            return false;
     }
 
     // Validate and apply

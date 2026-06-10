@@ -796,11 +796,17 @@ public:
         uint8_t     controller = 0;
         std::string colors;        // e.g. "BG" → buttons for {B} and {G}
         int         amount     = 1;
+        // When the producing ability carried a RestrictValid$ clause, the chosen
+        // colour becomes restricted mana. Empty restriction = ordinary mana.
+        std::string restriction;
+        ObjectId    producerId = kInvalidId;   // producing permanent (ChosenType resolution)
     };
     bool hasPendingManaChoice() const noexcept { return m_pendingManaChoice.active; }
     const PendingManaChoice& pendingManaChoice() const noexcept { return m_pendingManaChoice; }
-    void setPendingManaChoice(uint8_t ctrl, const std::string& colors, int amt) noexcept {
-        m_pendingManaChoice = {true, ctrl, colors, amt};
+    void setPendingManaChoice(uint8_t ctrl, const std::string& colors, int amt,
+                              std::string restriction = {},
+                              ObjectId producer = kInvalidId) noexcept {
+        m_pendingManaChoice = {true, ctrl, colors, amt, std::move(restriction), producer};
     }
     void clearPendingManaChoice() noexcept { m_pendingManaChoice = {}; }
 
