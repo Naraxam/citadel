@@ -552,6 +552,15 @@ void BoardRenderer::drawBattlefield(sf::RenderTarget& t, uint8_t pid,
             if (it != m_tapAnims.end() && it->second < 1.f)
                 opts.rotationOverride = 90.f * it->second;
         }
+        // Cosmetic tap during attacker declaration: a selected-but-not-yet-
+        // confirmed attacker is shown rotated (and flagged attacking) without
+        // actually tapping the card — the real tap waits for confirmation.
+        // Vigilant attackers don't tap, so only flag them as attacking.
+        if (!c->tapped && hints.pendingAttackers.count(c->id)) {
+            opts.attacking = true;
+            if (!c->rules->hasKeyword("Vigilance"))
+                opts.rotationOverride = 90.f;
+        }
         drawCard(t, *m_font, c, pos.x, pos.y, opts, m_picsDir);
 
         // Attached auras/equipment: render as small fan along the right edge
@@ -2161,11 +2170,26 @@ void drawArrow(sf::RenderTarget& t,
 } // namespace
 
 void BoardRenderer::drawCombatArrows(sf::RenderTarget& t,
-                                      const RenderHints&) const {
-    if (!m_tm || m_tm->combatState().empty()) return;
+                                      const RenderHints& hints) const {
+    static const sf::Color kAttackCol (230, 60, 40, 200);
+    static const sf::Color kBlockCol  (60, 180, 240, 160);
+    static const sf::Color kPendingCol(240, 175, 45, 220);  // amber = not yet confirmed
 
-    static const sf::Color kAttackCol(230, 60, 40, 200);
-    static const sf::Color kBlockCol (60, 180, 240, 160);
+    // Pending-attack arrows during declaration (before the attack is confirmed):
+    // each selected attacker points at the defending player's info bar.
+    if (!hints.pendingAttackers.empty()) {
+        float targX = PLAY_W * 0.5f;
+        float targY = (hints.pendingAttackDefender == 1)
+                        ? BOB_INFO_Y   + BOB_INFO_H   * 0.5f
+                        : ALICE_INFO_Y + ALICE_INFO_H * 0.5f;
+        for (ObjectId aid : hints.pendingAttackers) {
+            sf::Vector2f from = screenCenterOf(aid);
+            if (from.x < 1.f && from.y < 1.f) continue;
+            drawArrow(t, from, {targX, targY}, kPendingCol);
+        }
+    }
+
+    if (!m_tm || m_tm->combatState().empty()) return;
 
     for (const auto& atk : m_tm->combatState().attacks) {
         sf::Vector2f from = screenCenterOf(atk.attackerId);
@@ -2187,6 +2211,31 @@ void BoardRenderer::drawCombatArrows(sf::RenderTarget& t,
     }
 }
 
+void BoardRenderer::spawnCombatDamageText(ObjectId targetCard,
+                                           uint8_t targetPlayer, int amount) {
+    if (amount <= 0) return;
+    sf::Vector2f pos;
+    if (targetCard != kInvalidId) {
+        pos = screenCenterOf(targetCard);
+        if (pos.x < 1.f && pos.y < 1.f)         // off-screen / not laid out yet
+            pos = { PLAY_W * 0.5f, WIN_H * 0.5f };
+    } else {
+        pos.x = PLAY_W * 0.5f;
+        pos.y = (targetPlayer == 1) ? BOB_INFO_Y   + BOB_INFO_H   * 0.5f
+                                    : ALICE_INFO_Y + ALICE_INFO_H * 0.5f;
+    }
+    // Stagger overlapping numbers (e.g. several attackers hitting one player)
+    // so they don't stack on the exact same pixel: 0, +16, -16, +32, -32…
+    int n = static_cast<int>(m_floatTexts.size());
+    pos.x += ((n & 1) ? 1.f : -1.f) * static_cast<float>((n + 1) / 2) * 16.f;
+
+    FloatText ft;
+    ft.text  = "-" + std::to_string(amount);
+    ft.pos   = pos;
+    ft.color = sf::Color(235, 50, 40);
+    m_floatTexts.push_back(std::move(ft));
+}
+
 // ── Library search overlay ────────────────────────────────────────────────────
 
 namespace {
@@ -2194,18 +2243,24 @@ namespace {
 struct SearchPanelGeom {
     float pw, ph, px, py;
     float itemStartY, itemH, itemW, itemX;
+    float doneX, doneY, doneW, doneH;   // Done button (only when withDone)
 };
-SearchPanelGeom searchGeom(int count) {
+SearchPanelGeom searchGeom(int count, bool withDone = false) {
     SearchPanelGeom g;
     g.pw         = 460.f;
     g.itemH      = 26.f;
     g.itemW      = g.pw - 20.f;
     int visible  = std::min(count, 18);
     g.ph         = 36.f + visible * g.itemH + 8.f;
+    g.doneW      = 120.f;
+    g.doneH      = 26.f;
+    if (withDone) g.ph += g.doneH + 8.f;   // reserve a row for the Done button
     g.px         = (WIN_W - g.pw) * 0.5f;
     g.py         = (WIN_H - g.ph) * 0.5f;
     g.itemX      = g.px + 10.f;
     g.itemStartY = g.py + 34.f;
+    g.doneX      = g.px + (g.pw - g.doneW) * 0.5f;
+    g.doneY      = g.py + g.ph - g.doneH - 8.f;
     return g;
 }
 } // namespace
@@ -2219,7 +2274,7 @@ void BoardRenderer::drawLibrarySearchOverlay(sf::RenderTarget& t,
     dim.setFillColor(sf::Color(0, 0, 0, 160));
     t.draw(dim);
 
-    auto g = searchGeom(static_cast<int>(hints.searchChoices.size()));
+    auto g = searchGeom(static_cast<int>(hints.searchChoices.size()), hints.searchShowDone);
 
     sf::RectangleShape panel({g.pw, g.ph});
     panel.setPosition(g.px, g.py);
@@ -2274,12 +2329,31 @@ void BoardRenderer::drawLibrarySearchOverlay(sf::RenderTarget& t,
                 "... and " + std::to_string((int)hints.searchChoices.size() - 18) + " more",
                 g.itemX + 4.f, iy + 2.f, 11, sf::Color(140, 140, 140));
     }
+
+    // Done button — early-stop for "up to N" searches (Myriad Landscape etc.).
+    if (hints.searchShowDone) {
+        bool hover = (hints.mousePos.x >= g.doneX && hints.mousePos.x <= g.doneX + g.doneW &&
+                      hints.mousePos.y >= g.doneY && hints.mousePos.y <= g.doneY + g.doneH);
+        sf::RectangleShape btn({g.doneW, g.doneH});
+        btn.setPosition(g.doneX, g.doneY);
+        btn.setFillColor(hover ? sf::Color(70, 110, 70) : sf::Color(44, 70, 44));
+        btn.setOutlineColor(sf::Color(110, 160, 110));
+        btn.setOutlineThickness(1.f);
+        t.draw(btn);
+        sf::Text lbl("Done", *m_font, 14);
+        lbl.setStyle(sf::Text::Bold);
+        lbl.setFillColor(sf::Color(220, 240, 220));
+        auto lb = lbl.getLocalBounds();
+        lbl.setPosition(g.doneX + (g.doneW - lb.width) * 0.5f - lb.left,
+                        g.doneY + (g.doneH - lb.height) * 0.5f - lb.top);
+        t.draw(lbl);
+    }
 }
 
 ObjectId BoardRenderer::hitSearchChoice(float px, float py,
                                          const RenderHints& hints) const {
     if (!hints.showLibrarySearch || hints.searchChoices.empty()) return kInvalidId;
-    auto g = searchGeom(static_cast<int>(hints.searchChoices.size()));
+    auto g = searchGeom(static_cast<int>(hints.searchChoices.size()), hints.searchShowDone);
     float iy = g.itemStartY;
     int shown = 0;
     for (ObjectId id : hints.searchChoices) {
@@ -2293,9 +2367,21 @@ ObjectId BoardRenderer::hitSearchChoice(float px, float py,
     return kInvalidId;
 }
 
+bool BoardRenderer::hitSearchDone(float px, float py,
+                                   const RenderHints& hints) const {
+    if (!hints.showLibrarySearch || !hints.searchShowDone) return false;
+    auto g = searchGeom(static_cast<int>(hints.searchChoices.size()), hints.searchShowDone);
+    return px >= g.doneX && px <= g.doneX + g.doneW &&
+           py >= g.doneY && py <= g.doneY + g.doneH;
+}
+
 // ── Main draw ─────────────────────────────────────────────────────────────────
 
 void BoardRenderer::draw(sf::RenderTarget& t, const RenderHints& hints) const {
+    // Remember this frame's cosmetically-tapped attackers so update() can skip
+    // the tap-rotation animation when they later tap for real on confirmation.
+    m_lastPendingAttackers = hints.pendingAttackers;
+
     // Full-window background (bg_match.jpg fills everything behind all panels)
     drawBackground(t);
 
@@ -2965,7 +3051,10 @@ void BoardRenderer::update(float dt) {
     for (ObjectId id : curTapped) {
         if (m_lastTappedSet.count(id)) continue;          // already tapped
         if (m_tapAnims.count(id)) continue;               // anim already running
-        m_tapAnims[id] = 0.f;
+        // If this creature was shown cosmetically tapped during attacker
+        // declaration, it's already rotated on screen — start the anim fully
+        // complete so confirming the attack doesn't replay a 0→90° sweep.
+        m_tapAnims[id] = m_lastPendingAttackers.count(id) ? 1.f : 0.f;
 
         // If this card has an AB$ Mana ability AND it's controlled by Alice,
         // spawn a stream from the card to the right edge of her player chip
@@ -3016,6 +3105,13 @@ void BoardRenderer::update(float dt) {
         std::remove_if(m_manaStreams.begin(), m_manaStreams.end(),
                        [](const ManaStream& s){ return s.t >= 1.f; }),
         m_manaStreams.end());
+
+    // Advance floating combat-damage numbers; drop any that finished.
+    for (auto& ft : m_floatTexts) ft.t += dt;
+    m_floatTexts.erase(
+        std::remove_if(m_floatTexts.begin(), m_floatTexts.end(),
+                       [](const FloatText& f){ return f.t >= f.dur; }),
+        m_floatTexts.end());
     m_lastTappedSet = std::move(curTapped);
 
     m_lastBfSet  = curBf;
@@ -3091,6 +3187,27 @@ void BoardRenderer::drawAnims(sf::RenderTarget& t) const {
         halo.setFillColor(h);
         t.draw(halo);
         t.draw(dot);
+    }
+
+    // Floating combat-damage numbers: red "-N" that rises and fades out.
+    if (m_font) {
+        for (const auto& ft : m_floatTexts) {
+            float p     = std::clamp(ft.t / ft.dur, 0.f, 1.f);
+            float alpha = 1.f - p;                 // linear fade
+            float rise  = 34.f * p;                // drift upward
+            uint8_t a   = static_cast<uint8_t>(alpha * 255.f);
+            sf::Text txt(ft.text, *m_font, 22);
+            txt.setStyle(sf::Text::Bold);
+            sf::Color fc = ft.color; fc.a = a;
+            txt.setFillColor(fc);
+            txt.setOutlineColor(sf::Color(0, 0, 0, static_cast<uint8_t>(alpha * 200.f)));
+            txt.setOutlineThickness(2.f);
+            auto lb = txt.getLocalBounds();
+            txt.setPosition(ft.pos.x - lb.width * 0.5f,
+                            ft.pos.y - lb.height * 0.5f - rise);
+            ui::applyTextScale(txt);
+            t.draw(txt);
+        }
     }
 }
 

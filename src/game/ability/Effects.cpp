@@ -1055,11 +1055,11 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
             uint8_t mask = 0;
             for (const Card* cmd : ctx.game.command().cards())
                 if (cmd && cmd->isCommander && cmd->ownerId == ctx.controller)
-                    mask |= cmd->rules->manaCost.colorIdentity();
+                    mask |= cmd->rules->commanderColorIdentity();
             // Also fold in any commander currently on the battlefield (post-cast).
             for (const Card* bf : ctx.game.battlefield().cards())
                 if (bf && bf->isCommander && bf->ownerId == ctx.controller)
-                    mask |= bf->rules->manaCost.colorIdentity();
+                    mask |= bf->rules->commanderColorIdentity();
             if (mask == 0) mask = ManaAtom::WHITE | ManaAtom::BLUE  |
                                   ManaAtom::BLACK | ManaAtom::RED  |
                                   ManaAtom::GREEN;
@@ -1334,6 +1334,20 @@ void effectPump(const ScriptLine& s, EffectContext& ctx) {
     }
 }
 
+// Bitmask of the basic land types a card has — used by ShareLandType$ tutors
+// (Myriad Landscape) to require that every fetched card shares a land type.
+static uint8_t landTypeMask(const Card& c) {
+    uint8_t m = 0;
+    if (!c.rules) return m;
+    const auto& t = c.rules->type;
+    if (t.hasSubtype("Plains"))   m |= 0x01;
+    if (t.hasSubtype("Island"))   m |= 0x02;
+    if (t.hasSubtype("Swamp"))    m |= 0x04;
+    if (t.hasSubtype("Mountain")) m |= 0x08;
+    if (t.hasSubtype("Forest"))   m |= 0x10;
+    return m;
+}
+
 void effectChangeZone(const ScriptLine& s, EffectContext& ctx) {
     auto origin      = s.get("Origin",      "Library");
     auto destination = s.get("Destination", "Hand");
@@ -1465,20 +1479,46 @@ void effectChangeZone(const ScriptLine& s, EffectContext& ctx) {
         }
 
         uint8_t destCtrl = (dest == ZoneType::Battlefield) ? ctx.controller : libPlayer;
+        bool enterTapped    = (s.get("Tapped",        "") == "True");
+        bool shareLandType  = (s.get("ShareLandType", "") == "True");
 
-        // Human player (id 0) searches interactively in UI mode — defer to GameWindow
+        // Human player (id 0) searches interactively in UI mode — defer to GameWindow.
+        // numCards / Tapped$ / ShareLandType$ carry the "up to N (that share a land
+        // type), tapped" semantics (Myriad Landscape) through to the picker.
         if (libPlayer == 0 && ctx.game.isHumanInteractive()) {
-            ctx.game.setPendingSearch(libPlayer, dest, destCtrl, std::string(changeType));
+            ctx.game.setPendingSearch(libPlayer, dest, destCtrl, std::string(changeType),
+                                      numCards, enterTapped, shareLandType,
+                                      std::string(s.get("ChangeTypeDesc", "")));
             // Shuffle happens after the human completes their selection (in GameWindow)
             return;
         }
 
-        // AI / opponent — auto-pick first matching card
+        // AI / opponent — auto-pick up to numCards matching cards. Snapshot the
+        // candidate ids first (moving cards mutates the library mid-iteration).
         Player& p = ctx.game.player(libPlayer);
-        for (Card* c : p.library().cards()) {
-            if (cardMatchesAnyFilter(*c, changeType, libPlayer, kInvalidId, ctx.source, &ctx.game)) {
-                ctx.game.moveToZone(c->id, dest, destCtrl);
-                break;
+        std::vector<ObjectId> candidates;
+        for (Card* c : p.library().cards())
+            if (cardMatchesAnyFilter(*c, changeType, libPlayer, kInvalidId, ctx.source, &ctx.game))
+                candidates.push_back(c->id);
+
+        uint8_t shareMask = 0;   // intersection of land types of the cards picked so far
+        bool    haveShare = false;
+        int     found     = 0;
+        for (ObjectId cid : candidates) {
+            if (found >= numCards) break;
+            Card* c = ctx.game.findCard(cid);
+            if (!c) continue;
+            uint8_t lm = landTypeMask(*c);
+            // ShareLandType$: every fetched card must share a land type with the
+            // first (e.g. two of the same basic for Myriad Landscape).
+            if (shareLandType && haveShare && (lm & shareMask) == 0) continue;
+            Card* moved = ctx.game.moveToZone(cid, dest, destCtrl);
+            if (!moved) continue;
+            if (enterTapped && dest == ZoneType::Battlefield) moved->tapped = true;
+            ++found;
+            if (shareLandType) {
+                if (!haveShare) { shareMask = lm; haveShare = true; }
+                else            { shareMask &= lm; }
             }
         }
         // Always shuffle after searching

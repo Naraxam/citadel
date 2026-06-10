@@ -2014,10 +2014,12 @@ void GameWindow::handleEvents() {
             }
             // Library search overlay takes priority over all other clicks
             if (m_game.hasPendingSearch()) {
-                ObjectId chosen = m_renderer.hitSearchChoice(px, py,
-                    [&]{ RenderHints h; h.showLibrarySearch = true;
-                         h.searchChoices = m_searchChoices; return h; }());
-                if (chosen != kInvalidId) completePendingSearch(chosen);
+                RenderHints h; h.showLibrarySearch = true;
+                h.searchChoices  = m_searchChoices;
+                h.searchShowDone = m_game.pendingSearch().numCards > 1;
+                ObjectId chosen = m_renderer.hitSearchChoice(px, py, h);
+                if (chosen != kInvalidId)                       completePendingSearch(chosen);
+                else if (m_renderer.hitSearchDone(px, py, h))   finishPendingSearch();
                 continue;
             }
             // Pending Connive discard — click a hand card to discard it
@@ -2242,12 +2244,10 @@ void GameWindow::handleEvents() {
 }
 
 void GameWindow::update() {
-    // Advance visual animations each frame (scaled by animation speed setting)
-    {
-        float dt = m_animClock.restart().asSeconds();
-        if (dt > 0.1f) dt = 0.1f;
-        m_renderer.update(dt * m_animSpeed);
-    }
+    // Visual animations are advanced in render() (which runs in every loop,
+    // including nested combat/priority windows) — keep the clock ticking here so
+    // the toast timer below reads a consistent delta.
+    m_animClock.restart();
 
     // Flush any textures that finished loading on the background thread
     ui::TextureCache::flushPending();
@@ -2531,10 +2531,12 @@ void GameWindow::humanPriorityWindow() {
                     continue;
                 }
                 if (m_game.hasPendingSearch()) {
-                    ObjectId chosen = m_renderer.hitSearchChoice(px, py,
-                        [&]{ RenderHints h; h.showLibrarySearch = true;
-                             h.searchChoices = m_searchChoices; return h; }());
-                    if (chosen != kInvalidId) completePendingSearch(chosen);
+                    RenderHints h; h.showLibrarySearch = true;
+                    h.searchChoices  = m_searchChoices;
+                    h.searchShowDone = m_game.pendingSearch().numCards > 1;
+                    ObjectId chosen = m_renderer.hitSearchChoice(px, py, h);
+                    if (chosen != kInvalidId)                     completePendingSearch(chosen);
+                    else if (m_renderer.hitSearchDone(px, py, h)) finishPendingSearch();
                     continue;
                 }
                 if (m_game.hasPendingDiscard()) {
@@ -4904,14 +4906,47 @@ void GameWindow::completeMadnessCast(bool wantCast) {
 
 // ── Library search ────────────────────────────────────────────────────────────
 
+// Basic-land-type bitmask, matching landTypeMask() in Effects.cpp — used to keep
+// a ShareLandType$ search (Myriad Landscape) restricted to cards that share a
+// land type with whatever has already been picked.
+static uint8_t searchLandTypeMask(const Card& c) {
+    uint8_t m = 0;
+    if (!c.rules) return m;
+    const auto& t = c.rules->type;
+    if (t.hasSubtype("Plains"))   m |= 0x01;
+    if (t.hasSubtype("Island"))   m |= 0x02;
+    if (t.hasSubtype("Swamp"))    m |= 0x04;
+    if (t.hasSubtype("Mountain")) m |= 0x08;
+    if (t.hasSubtype("Forest"))   m |= 0x10;
+    return m;
+}
+
 void GameWindow::rebuildSearchChoices() {
     m_searchChoices.clear();
     if (!m_game.hasPendingSearch()) return;
     const auto& ps = m_game.pendingSearch();
     const Player& p = m_game.player(ps.libPlayer);
-    for (const Card* c : p.library().cards())
-        if (cardMatchesAnyFilter(*c, ps.filter, ps.libPlayer))
-            m_searchChoices.push_back(c->id);
+
+    // ShareLandType$: once a card has been picked, only offer library cards that
+    // still share a land type with every prior pick (intersection of masks).
+    uint8_t shareMask = 0;
+    bool    haveShare = false;
+    if (ps.shareLandType) {
+        for (ObjectId pid : ps.picked) {
+            const Card* pc = m_game.findCard(pid);
+            if (!pc) continue;
+            uint8_t lm = searchLandTypeMask(*pc);
+            if (!haveShare) { shareMask = lm; haveShare = true; }
+            else            { shareMask &= lm; }
+        }
+    }
+
+    for (const Card* c : p.library().cards()) {
+        if (!cardMatchesAnyFilter(*c, ps.filter, ps.libPlayer)) continue;
+        if (ps.shareLandType && haveShare &&
+            (searchLandTypeMask(*c) & shareMask) == 0) continue;
+        m_searchChoices.push_back(c->id);
+    }
 }
 
 // ── Forced discard helpers ────────────────────────────────────────────────────
@@ -5020,19 +5055,44 @@ void GameWindow::completeScryChoice(bool keepTop) {
 
 void GameWindow::completePendingSearch(ObjectId selectedId) {
     if (!m_game.hasPendingSearch()) return;
-    const auto ps = m_game.pendingSearch();  // copy before clearing
-    m_game.clearPendingSearch();
+    auto& ps = m_game.pendingSearchMutable();
     Card* moved = m_game.moveToZone(selectedId, ps.dest, ps.destCtrl);
-    m_game.player(ps.libPlayer).library().shuffle(m_game.rng());
+    if (moved) {
+        if (ps.tapped && ps.dest == ZoneType::Battlefield) moved->tapped = true;
+        ps.picked.push_back(moved->id);
+        std::string name = moved->rules ? moved->rules->name : "card";
+        addLog(m_game.player(ps.libPlayer).name() + " finds " + name + " from library.");
+    }
+    // "Up to N" searches stay open until the player has taken N cards, the
+    // library runs out of valid choices, or they press Done (finishPendingSearch).
+    rebuildSearchChoices();   // re-filter (ShareLandType) and drop the picked card
+    if (static_cast<int>(ps.picked.size()) >= ps.numCards || m_searchChoices.empty())
+        finishPendingSearch();
+}
+
+void GameWindow::finishPendingSearch() {
+    if (!m_game.hasPendingSearch()) return;
+    uint8_t lib = m_game.pendingSearch().libPlayer;
+    m_game.player(lib).library().shuffle(m_game.rng());
+    m_game.clearPendingSearch();
     m_searchChoices.clear();
-    std::string name = (moved && moved->rules) ? moved->rules->name : "card";
-    addLog(m_game.player(ps.libPlayer).name() + " finds " + name + " from library.");
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 void GameWindow::render() {
     m_window.setView(m_gameView);
+
+    // Advance visual animations here so they also play during nested combat /
+    // priority loops (which call render() but not update()). Then surface any
+    // queued combat damage as floating red numbers.
+    {
+        float dt = m_renderClock.restart().asSeconds();
+        if (dt > 0.1f) dt = 0.1f;
+        for (const auto& fx : m_game.drainCombatDamageFx())
+            m_renderer.spawnCombatDamageText(fx.targetCard, fx.targetPlayer, fx.amount);
+        m_renderer.update(dt * m_animSpeed);
+    }
 
     // Surface any cast-failure message that chooseMode/onConfirm recorded since
     // the last tick. Logged once per attempt; popup stays up so the player can
@@ -5184,9 +5244,18 @@ void GameWindow::render() {
 
     // Library search overlay
     if (m_game.hasPendingSearch()) {
+        const auto& ps = m_game.pendingSearch();
         hints.showLibrarySearch  = true;
         hints.searchChoices      = m_searchChoices;
-        hints.searchInstruction  = "Choose a card from your library";
+        int remaining = ps.numCards - static_cast<int>(ps.picked.size());
+        std::string what = ps.instruction.empty() ? "a card" : ps.instruction;
+        if (ps.numCards > 1) {
+            hints.searchShowDone = true;
+            hints.searchInstruction = "Choose " + what + " from your library (up to " +
+                                      std::to_string(remaining) + " more) — or Done";
+        } else {
+            hints.searchInstruction = "Choose " + what + " from your library";
+        }
     }
 
     if (m_tm.isGameOver()) {

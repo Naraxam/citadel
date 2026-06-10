@@ -83,6 +83,20 @@ struct PendingLibrarySearch {
     ZoneType    dest      = ZoneType::Hand;
     uint8_t     destCtrl  = 0;
     std::string filter;   // Forge ValidCards$ filter string (e.g. "Basic Land")
+    int         numCards      = 1;     // ChangeNum$ — search for up to this many
+    bool        tapped        = false; // Tapped$ True — enter the battlefield tapped
+    bool        shareLandType = false; // ShareLandType$ — every pick shares a land type
+    std::vector<ObjectId> picked;      // cards already chosen this search (multi-pick)
+    std::string instruction;           // human-readable prompt (ChangeTypeDesc$)
+};
+
+// A combat-damage instance to surface as a floating red number in the UI.
+// Pushed by TurnManager::dealCombatDamage (interactive games only), drained by
+// the GameWindow each frame and handed to the renderer as a float-text anim.
+struct CombatDamageFx {
+    ObjectId targetCard   = kInvalidId; // creature that took damage (kInvalidId = a player)
+    uint8_t  targetPlayer = 0;          // valid when targetCard == kInvalidId
+    int      amount       = 0;
 };
 
 class GameState {
@@ -560,6 +574,7 @@ private:
     std::vector<Emblem> m_emblems;
 
     std::string m_pendingReveal;
+    std::vector<CombatDamageFx> m_combatDamageFx;
 
     // Optional pointer to the card database (set via setCardDb; not owned).
     // Used by MakeCard effects and similar "create from nowhere" effects.
@@ -583,6 +598,15 @@ public:
     // Returns the name of a morph revealed this step, then clears it.
     std::string drainPendingReveal() noexcept {
         return std::move(m_pendingReveal);
+    }
+
+    // Combat-damage floating numbers. TurnManager pushes one per damage instance;
+    // the GameWindow drains them each frame to spawn red "-N" text in the UI.
+    void pushCombatDamageFx(ObjectId card, uint8_t player, int amount) {
+        if (amount > 0) m_combatDamageFx.push_back({card, player, amount});
+    }
+    std::vector<CombatDamageFx> drainCombatDamageFx() {
+        return std::move(m_combatDamageFx);
     }
 
     // Exploit: when a creature with Exploit ETBs, the controller may sacrifice a creature.
@@ -765,9 +789,14 @@ public:
     // Library search (tutor) — deferred for human player to pick interactively
     bool hasPendingSearch() const noexcept { return m_pendingSearch.active; }
     const PendingLibrarySearch& pendingSearch() const noexcept { return m_pendingSearch; }
+    PendingLibrarySearch& pendingSearchMutable() noexcept { return m_pendingSearch; }
     void setPendingSearch(uint8_t libPlayer, ZoneType dest,
-                          uint8_t destCtrl, const std::string& filter) noexcept {
-        m_pendingSearch = {true, libPlayer, dest, destCtrl, filter};
+                          uint8_t destCtrl, const std::string& filter,
+                          int numCards = 1, bool tapped = false,
+                          bool shareLandType = false,
+                          const std::string& instruction = "") noexcept {
+        m_pendingSearch = {true, libPlayer, dest, destCtrl, filter,
+                           numCards, tapped, shareLandType, {}, instruction};
     }
     void clearPendingSearch() noexcept { m_pendingSearch = {}; }
 

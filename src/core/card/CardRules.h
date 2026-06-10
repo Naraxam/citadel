@@ -534,6 +534,14 @@ struct CardRules {
     bool isPermanent() const noexcept { return type.isPermanent(); }
 
     bool hasKeyword(std::string_view kw) const noexcept;
+
+    // True Commander "color identity" (WUBRG bitmask): the colours of the mana
+    // cost PLUS every coloured mana symbol that appears in the card's rules text
+    // and activation costs (e.g. an off-colour ability cost like Najeela's
+    // {W}{U}{B}{R}{G}). This is broader than manaCost.colorIdentity(), which only
+    // sees the casting cost — use this for "any colour in your commander's colour
+    // identity" effects (Arcane Signet, Command Tower, Path of Ancestry…).
+    uint8_t commanderColorIdentity() const;
 };
 
 } // namespace mtg

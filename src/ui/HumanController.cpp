@@ -115,6 +115,9 @@ void HumanController::resetToMainPhase() noexcept {
     m_pendingBlocker     = kInvalidId;
     m_pendingNinja       = kInvalidId;
     m_pendingPW          = kInvalidId;
+    m_pwAbilIdxs.clear();
+    m_pwAbilKinds.clear();
+    m_pwAbilLabels.clear();
     m_attackers.clear();
     m_orderingAttackers.clear();
     m_orderedBlockers.clear();
@@ -486,6 +489,7 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
             // Planeswalker: collect loyalty abilities and request choice overlay
             if (c->rules->type.isPlaneswalker()) {
                 m_pwAbilIdxs.clear();
+                m_pwAbilKinds.clear();   // loyalty abilities are all kind 0
                 m_pwAbilLabels.clear();
                 for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
                     auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
@@ -519,91 +523,38 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                 return true;
             }
 
-            // 2. Check for Equip keyword — enter EquipSelect
+            // 2. Equip keyword — note its cost; we decide below whether to enter
+            //    EquipSelect directly or fold it into a picker (Shadowspear also
+            //    has a {1} activated ability, so equipping can't pre-empt it).
+            int equipCost = -1;
             for (const auto& kw : c->rules->keywords) {
-                if (parseEquipCost(kw) >= 0) {
-                    m_pendingEquip = id;
-                    m_state = HumanState::EquipSelect;
-                    return true;
-                }
+                int ec = parseEquipCost(kw);
+                if (ec >= 0) { equipCost = ec; break; }
             }
 
-            // 3. Non-mana activated abilities. Collect every line so that a
-            //    card with 2+ activated abilities opens a picker (the same
-            //    overlay the planeswalker option box uses) instead of always
-            //    auto-firing only the first ability.
-            {
-                std::vector<int>         abilIdxs;
-                std::vector<std::string> abilLabels;
-                for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
-                    auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
-                    if (s.abilityType != "AB" ||
-                        s.effectType == "Mana" || s.effectType == "ManaReflected") continue;
+            // 3. Non-mana activated abilities (collect; don't act yet).
+            std::vector<int>         abilIdxs;
+            std::vector<std::string> abilLabels;
+            for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
+                auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
+                if (s.abilityType != "AB" ||
+                    s.effectType == "Mana" || s.effectType == "ManaReflected") continue;
 
-                    // Build a short label: prefer the spell description,
-                    // else combine effect type + cost so the player can tell
-                    // similar abilities apart.
-                    std::string label = std::string(s.get("SpellDescription", ""));
-                    if (label.empty()) {
-                        std::string cost = std::string(s.get("Cost", ""));
-                        std::string eff  = std::string(s.effectType);
-                        if (!cost.empty()) label = cost + ": " + eff;
-                        else               label = eff.empty() ? std::string("Activate") : eff;
-                    }
-                    if (label.size() > 60) label = label.substr(0, 57) + "...";
-                    abilIdxs.push_back(i);
-                    abilLabels.push_back(std::move(label));
+                // Build a short label: prefer the spell description, else combine
+                // effect type + cost so the player can tell abilities apart.
+                std::string label = std::string(s.get("SpellDescription", ""));
+                if (label.empty()) {
+                    std::string cost = std::string(s.get("Cost", ""));
+                    std::string eff  = std::string(s.effectType);
+                    if (!cost.empty()) label = cost + ": " + eff;
+                    else               label = eff.empty() ? std::string("Activate") : eff;
                 }
-
-                if (abilIdxs.size() >= 2) {
-                    // Multiple abilities — reuse the existing PW overlay
-                    // mechanism (m_pendingPW / m_pwAbilIdxs / m_pwAbilLabels)
-                    // since GameWindow already renders + dispatches it; this
-                    // way the overlay works for any card.
-                    m_pendingPW    = id;
-                    m_pwAbilIdxs   = std::move(abilIdxs);
-                    m_pwAbilLabels = std::move(abilLabels);
-                    return true;
-                }
-
-                if (abilIdxs.size() == 1) {
-                    int i = abilIdxs[0];
-                    auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
-
-                    // Activation-cost indicator: parse the mana portion of the
-                    // ability's Cost and, if the player can't pay it right now,
-                    // tell them the cost instead of silently doing nothing (the
-                    // "why won't my ability fire?" / "is it summoning sick?"
-                    // confusion). They can tap lands and click again.
-                    mtg::ManaCost mc = abilityManaCost(s.get("Cost", ""));
-                    const ManaPool& pool = m_game.player(0).manaPool();
-                    if (!mc.isNoCost() && !pool.canPay(mc)) {
-                        std::string have = pool.toString();
-                        if (have.empty()) have = "(empty)";
-                        m_castError = "Activate " + c->rules->name + ": need " +
-                                      mc.toString() + " — pool has " + have +
-                                      ". Tap lands for mana, then click it again.";
-                        return true;
-                    }
-
-                    auto validTgts = s.get("ValidTgts", "");
-                    if (!validTgts.empty()) {
-                        m_pendingAbilityCard = id;
-                        m_pendingAbilityIdx  = i;
-                        m_state = HumanState::AbilityTarget;
-                    } else if (!m_abilities.activateAbility(id, i, 0, {})) {
-                        m_castError = "Couldn't activate " + c->rules->name +
-                                      " right now (timing, restriction, or already used).";
-                    } else {
-                        runSBAs();
-                        checkAndHandleTriggers();
-                    }
-                    return true;
-                }
-                // 0 non-mana abilities → fall through to mana-ability path.
+                if (label.size() > 60) label = label.substr(0, 57) + "...";
+                abilIdxs.push_back(i);
+                abilLabels.push_back(std::move(label));
             }
 
-            // 4. Fall back to mana ability. Count mana lines on this card:
+            // 4. Mana abilities. Count mana lines on this card:
             //    1 → activate directly UNLESS the cost destroys the source
             //    (sacrifice / discard self) — those get the picker as a
             //    confirmation step.
@@ -655,10 +606,10 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                             uint8_t mask = 0;
                             for (const Card* cmd : m_game.command().cards())
                                 if (cmd && cmd->isCommander && cmd->ownerId == 0)
-                                    mask |= cmd->rules->manaCost.colorIdentity();
+                                    mask |= cmd->rules->commanderColorIdentity();
                             for (const Card* bf : m_game.battlefield().cards())
                                 if (bf && bf->isCommander && bf->ownerId == 0)
-                                    mask |= bf->rules->manaCost.colorIdentity();
+                                    mask |= bf->rules->commanderColorIdentity();
                             if (mask == 0) mask = ManaAtom::WHITE | ManaAtom::BLUE |
                                                   ManaAtom::BLACK | ManaAtom::RED |
                                                   ManaAtom::GREEN;
@@ -732,18 +683,55 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                 addCol("Plains",'W'); addCol("Island",'U'); addCol("Swamp",'B');
                 addCol("Mountain",'R'); addCol("Forest",'G');
             }
-            // Show the picker when there's a real choice OR whenever any
-            // option pays a destructive cost — gives the player a guaranteed
-            // chance to back out before losing a permanent (Blood Pet,
-            // Lotus Petal, Skirk Prospector, etc.).
-            if (opts.size() >= 2 || (opts.size() == 1 && hasDestructiveCost)) {
-                m_manaAbilitySource  = id;
-                m_manaAbilityOptions = std::move(opts);
-                m_state              = HumanState::ManaAbilityChoice;
+            // 5. Decide how to present the activation choice.
+            bool hasOther = (equipCost >= 0) || !abilIdxs.empty();
+            if (!hasOther) {
+                // Pure mana source (the common case: most lands and mana rocks).
+                // Show the picker when there's a real colour/cost choice OR a
+                // destructive cost to confirm; otherwise tap straight away.
+                if (opts.size() >= 2 || (opts.size() == 1 && hasDestructiveCost)) {
+                    m_manaAbilitySource  = id;
+                    m_manaAbilityOptions = std::move(opts);
+                    m_state              = HumanState::ManaAbilityChoice;
+                    return true;
+                }
+                m_abilities.activateManaAbility(id, 0);
+                checkAndHandleTriggers();
                 return true;
             }
-            m_abilities.activateManaAbility(id, 0);
-            checkAndHandleTriggers();
+
+            // The permanent offers Equip and/or non-mana abilities — possibly
+            // alongside a mana ability. Fold every option into one picker so the
+            // player can choose (Eiganjo Castle: tap for {W} OR prevent damage;
+            // Shadowspear: equip OR its {1} ability).
+            std::vector<int>         cIdx;
+            std::vector<int>         cKind;   // 0 ability, 1 mana, 2 equip
+            std::vector<std::string> cLabel;
+            if (equipCost >= 0) {
+                cIdx.push_back(0);
+                cKind.push_back(2);
+                cLabel.push_back(equipCost > 0 ? "Equip {" + std::to_string(equipCost) + "}"
+                                               : std::string("Equip"));
+            }
+            for (size_t k = 0; k < abilIdxs.size(); ++k) {
+                cIdx.push_back(abilIdxs[k]);
+                cKind.push_back(0);
+                cLabel.push_back(abilLabels[k]);
+            }
+            for (const auto& mo : opts) {
+                cIdx.push_back(mo.abilityIndex);
+                cKind.push_back(1);
+                cLabel.push_back(mo.label);
+            }
+
+            // A single option needs no picker — dispatch it straight away.
+            if (cIdx.size() == 1)
+                return activatePermanentChoice(id, cKind[0], cIdx[0]);
+
+            m_pendingPW    = id;
+            m_pwAbilIdxs   = std::move(cIdx);
+            m_pwAbilKinds  = std::move(cKind);
+            m_pwAbilLabels = std::move(cLabel);
             return true;
         }
         return false;
@@ -1658,29 +1646,67 @@ void HumanController::activatePWAbility(int choiceIdx) {
     if (m_pendingPW == kInvalidId ||
         choiceIdx < 0 || choiceIdx >= static_cast<int>(m_pwAbilIdxs.size()))
         return;
-    ObjectId pwId      = m_pendingPW;
-    int      abilityIdx = m_pwAbilIdxs[choiceIdx];
+    ObjectId pwId = m_pendingPW;
+    int      idx  = m_pwAbilIdxs[choiceIdx];
+    int      kind = (choiceIdx < static_cast<int>(m_pwAbilKinds.size()))
+                    ? m_pwAbilKinds[choiceIdx] : 0;   // loyalty abilities = kind 0
     cancelPWChoice();
+    activatePermanentChoice(pwId, kind, idx);
+}
 
-    Card* pw = m_game.findCard(pwId);
-    if (!pw) return;
-    auto s = mtg::parseScriptLine(pw->rules->abilityLines[abilityIdx]);
+// Dispatch one chosen activation option. kind: 0 = non-mana activated ability
+// (idx into abilityLines), 1 = mana ability (idx into AB$ Mana lines), 2 = Equip.
+bool HumanController::activatePermanentChoice(ObjectId id, int kind, int idx) {
+    Card* c = m_game.findCard(id);
+    if (!c) return false;
+
+    if (kind == 2) {                       // Equip
+        m_pendingEquip = id;
+        m_state        = HumanState::EquipSelect;
+        return true;
+    }
+    if (kind == 1) {                       // Mana ability
+        m_abilities.activateManaAbility(id, 0, idx);
+        checkAndHandleTriggers();
+        return true;
+    }
+
+    // kind 0 — non-mana activated ability.
+    auto s = mtg::parseScriptLine(c->rules->abilityLines[idx]);
+
+    // Activation-cost indicator: if the player can't pay the mana portion right
+    // now, tell them the cost instead of silently doing nothing. (Loyalty costs
+    // aren't mana, so this check is a no-op for planeswalker abilities.)
+    mtg::ManaCost mc = abilityManaCost(s.get("Cost", ""));
+    const ManaPool& pool = m_game.player(0).manaPool();
+    if (!mc.isNoCost() && !pool.canPay(mc)) {
+        std::string have = pool.toString();
+        if (have.empty()) have = "(empty)";
+        m_castError = "Activate " + c->rules->name + ": need " + mc.toString() +
+                      " — pool has " + have +
+                      ". Tap lands for mana, then click it again.";
+        return true;
+    }
+
     auto validTgts = std::string(s.get("ValidTgts", ""));
     if (!validTgts.empty()) {
-        m_pendingAbilityCard = pwId;
-        m_pendingAbilityIdx  = abilityIdx;
+        m_pendingAbilityCard = id;
+        m_pendingAbilityIdx  = idx;
         m_state = HumanState::AbilityTarget;
+    } else if (!m_abilities.activateAbility(id, idx, 0, {})) {
+        m_castError = "Couldn't activate " + c->rules->name +
+                      " right now (timing, restriction, or already used).";
     } else {
-        if (m_abilities.activateAbility(pwId, abilityIdx, 0, {})) {
-            runSBAs(); // ability on stack — [Pass] resolves it
-            checkAndHandleTriggers();
-        }
+        runSBAs(); // ability on stack — [Pass] resolves it
+        checkAndHandleTriggers();
     }
+    return true;
 }
 
 void HumanController::cancelPWChoice() {
     m_pendingPW = kInvalidId;
     m_pwAbilIdxs.clear();
+    m_pwAbilKinds.clear();
     m_pwAbilLabels.clear();
 }
 
@@ -1690,6 +1716,13 @@ RenderHints HumanController::buildHints() const {
     RenderHints h;
     h.phase       = std::string(m_tm.currentStepName());
     h.selectedCards = m_attackers; // highlight selected attackers
+
+    // During attacker declaration, surface the selected attackers + defender so
+    // the renderer can cosmetically tap them and draw pending-attack arrows.
+    if (m_state == HumanState::DeclareAttack) {
+        h.pendingAttackers       = m_attackers;
+        h.pendingAttackDefender  = m_attackDefender;
+    }
 
     if (m_pendingSpell != kInvalidId) {
         h.selectedCards.insert(m_pendingSpell);
@@ -1706,9 +1739,14 @@ RenderHints HumanController::buildHints() const {
     if (m_pendingPW          != mtg::kInvalidId) h.selectedCards.insert(m_pendingPW);
     if (m_pendingNinja       != mtg::kInvalidId) h.selectedCards.insert(m_pendingNinja);
 
-    // PW overlay: override instruction before state switch
+    // Ability-choice overlay: override instruction before state switch. The
+    // same overlay now serves planeswalker loyalty abilities and any permanent
+    // offering several activation options (Eiganjo Castle, Shadowspear…).
     if (m_pendingPW != mtg::kInvalidId) {
-        h.instruction = "Choose a loyalty ability.";
+        const Card* pw = m_game.findCard(m_pendingPW);
+        h.instruction = (pw && pw->rules && pw->rules->type.isPlaneswalker())
+                        ? "Choose a loyalty ability."
+                        : "Choose an ability (or click elsewhere to cancel).";
         return h;
     }
 

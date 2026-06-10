@@ -971,6 +971,16 @@ void TurnManager::dealCombatDamage(bool isFirstStrikeStep) {
         TriggerSystem::onDamageDoneOnce(damageEvents, m_game, once);
         m_game.queueTriggers(std::move(once));
     }
+
+    // Surface each damage instance as a floating red number in the UI. Only in
+    // interactive games — the AI search clones don't render and shouldn't pay
+    // the bookkeeping cost.
+    if (m_game.isHumanInteractive()) {
+        for (const auto& ev : damageEvents) {
+            if (ev.toPlayer) m_game.pushCombatDamageFx(kInvalidId, ev.targetPlayer, ev.amount);
+            else             m_game.pushCombatDamageFx(ev.targetCardId, 0, ev.amount);
+        }
+    }
 }
 
 void TurnManager::endCombat() {

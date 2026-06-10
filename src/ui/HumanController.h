@@ -189,10 +189,18 @@ private:
     mtg::ObjectId          m_pendingBlocker = mtg::kInvalidId; // blocker selected, waiting for attacker click
     mtg::ObjectId          m_pendingNinja   = mtg::kInvalidId; // Ninja selected for Ninjutsu swap
 
-    // Planeswalker ability overlay state
+    // Ability-choice overlay state. Originally just planeswalker loyalty
+    // abilities; now also used for any permanent that offers more than one way
+    // to activate it (Eiganjo Castle: tap for {W} OR prevent damage;
+    // Shadowspear: equip OR its {1} ability). m_pwAbilKinds runs parallel to
+    // m_pwAbilIdxs: 0 = non-mana activated ability (idx into abilityLines),
+    // 1 = mana ability (idx into the source's AB$ Mana lines), 2 = Equip.
     mtg::ObjectId              m_pendingPW       = mtg::kInvalidId;
     std::vector<int>           m_pwAbilIdxs;
+    std::vector<int>           m_pwAbilKinds;
     std::vector<std::string>   m_pwAbilLabels;
+    // Dispatch a single chosen activation option on a permanent (see kinds above).
+    bool activatePermanentChoice(mtg::ObjectId id, int kind, int idx);
 
     // Blocker ordering state (HumanState::OrderBlockers)
     std::vector<mtg::ObjectId> m_orderingAttackers;    // human attackers with 2+ blockers

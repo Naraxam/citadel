@@ -31,10 +31,18 @@ struct RenderHints {
     bool                    showOkButton  = false;
     bool                    showCancelBtn = false;
 
+    // Attacker declaration (pre-confirmation): creatures the human has selected
+    // to attack, and the defending player (255 = none). The renderer cosmetically
+    // taps these and draws amber pending-attack arrows; no real tap or fly
+    // animation happens until the attack is actually confirmed.
+    std::set<mtg::ObjectId> pendingAttackers;
+    uint8_t                 pendingAttackDefender = 255;
+
     // Library search overlay (tutor)
     bool                       showLibrarySearch = false;
     std::vector<mtg::ObjectId> searchChoices;     // pre-filtered matching card IDs
     std::string                searchInstruction; // e.g. "Search for a basic land"
+    bool                       searchShowDone = false; // "up to N" — offer a Done button
 
     // Blocker ordering: maps blocker ID → 1-based position in damage order.
     // Populated only during HumanState::OrderBlockers.
@@ -126,6 +134,19 @@ public:
         float        dur = 0.45f;
     };
 
+    // A floating "-N" combat-damage number that rises and fades. Spawned via
+    // spawnCombatDamageText() when the GameWindow drains the game's damage FX.
+    struct FloatText {
+        std::string  text;
+        sf::Vector2f pos;
+        sf::Color    color = sf::Color(235, 50, 40);
+        float        t   = 0.f;
+        float        dur = 1.2f;
+    };
+    // Spawn a red damage number over a creature (targetCard) or a player's info
+    // bar (targetCard == kInvalidId). No-op for amount <= 0.
+    void spawnCombatDamageText(mtg::ObjectId targetCard, uint8_t targetPlayer, int amount);
+
     struct HitResult {
         mtg::ObjectId id     = mtg::kInvalidId;
         mtg::ZoneType zone   {};
@@ -154,6 +175,7 @@ public:
     // Returns the card ID the click lands on in the library-search overlay,
     // or kInvalidId if the click misses all items.
     mtg::ObjectId hitSearchChoice(float px, float py, const RenderHints& hints) const;
+    bool          hitSearchDone(float px, float py, const RenderHints& hints) const;
 
 private:
     const sf::Font*             m_font      = nullptr;
@@ -245,6 +267,12 @@ public:
     mutable std::set<mtg::ObjectId>           m_lastTappedSet;
     std::map<mtg::ObjectId, float>            m_tapAnims;     // 0..1 progress
     std::vector<ManaStream>                   m_manaStreams;
+    std::vector<FloatText>                    m_floatTexts;   // combat damage numbers
+    // Attackers shown as cosmetically tapped during declaration (RenderHints
+    // .pendingAttackers) last frame — so when the attack is confirmed and the
+    // creature really taps, we skip the 0→90° re-rotation (it's already shown
+    // rotated). Tracked across frames by update().
+    mutable std::set<mtg::ObjectId>           m_lastPendingAttackers;
 
     // Hit-rects for the info-bar GY/Exile icons, refreshed each draw pass.
     // Indexed by player (0 = Alice, 1 = Bob).

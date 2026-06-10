@@ -212,6 +212,8 @@ private:
     sf::Vector2f  m_mousePos    = {-1.f, -1.f};
     sf::View      m_gameView;
     sf::Clock     m_animClock;   // wall-clock for animation delta time
+    sf::Clock     m_renderClock; // per-render delta; advances visual anims in every
+                                 // render path (incl. nested combat/priority loops)
     SoundManager  m_sound;       // procedural audio
     HumanController::PhaseStops m_stops;  // which steps pause for player input
     mtg::ObjectId m_browseSelect = mtg::kInvalidId;
@@ -392,6 +394,7 @@ private:
     // ── Library search helpers ────────────────────────────────────────────
     void rebuildSearchChoices();
     void completePendingSearch(mtg::ObjectId selectedId);
+    void finishPendingSearch();   // shuffle + clear an "up to N" search (Done / exhausted)
 
     // ── Riot / Fabricate / Charm / Madness choice helpers ────────────────
     void completeRiotChoice(bool giveHaste);
