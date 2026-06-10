@@ -489,7 +489,8 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                 m_pwAbilLabels.clear();
                 for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
                     auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
-                    if (s.abilityType != "AB" || s.effectType == "Mana") continue;
+                    if (s.abilityType != "AB" ||
+                        s.effectType == "Mana" || s.effectType == "ManaReflected") continue;
                     m_pwAbilIdxs.push_back(i);
                     m_pwAbilLabels.push_back(loyaltyCostLabel(std::string(s.get("Cost", ""))));
                 }
@@ -536,7 +537,8 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                 std::vector<std::string> abilLabels;
                 for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
                     auto s = mtg::parseScriptLine(c->rules->abilityLines[i]);
-                    if (s.abilityType != "AB" || s.effectType == "Mana") continue;
+                    if (s.abilityType != "AB" ||
+                        s.effectType == "Mana" || s.effectType == "ManaReflected") continue;
 
                     // Build a short label: prefer the spell description,
                     // else combine effect type + cost so the player can tell
@@ -616,7 +618,17 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
             for (const auto* lp : manaLines) {
                 const auto& raw = *lp;
                 auto s = parseScriptLine(raw);
-                if (s.abilityType != "AB" || s.effectType != "Mana") continue;
+                if (s.abilityType != "AB" ||
+                    (s.effectType != "Mana" && s.effectType != "ManaReflected")) continue;
+                // Reflected mana (Exotic Orchard): the colour is chosen after the
+                // ability resolves (a pending-mana-choice overlay), so just label it.
+                if (s.effectType == "ManaReflected") {
+                    std::string lbl = std::string(s.get("SpellDescription", "Add any color"));
+                    if (lbl.size() > 60) lbl = lbl.substr(0, 57) + "...";
+                    opts.push_back({manaIdx, std::move(lbl)});
+                    ++manaIdx;
+                    continue;
+                }
                 std::string produced = std::string(s.get("Produced", "C"));
                 if (produced == "Any" || produced == "AnyColor") {
                     opts.push_back({manaIdx, "Add any color"});
@@ -763,9 +775,12 @@ bool HumanController::onCardClick(ObjectId id, ZoneType zone, uint8_t player) {
                 for (const auto* lp : manaLines) {
                     const auto& raw = *lp;
                     auto s = parseScriptLine(raw);
-                    if (s.abilityType != "AB" || s.effectType != "Mana") continue;
+                    if (s.abilityType != "AB" ||
+                        (s.effectType != "Mana" && s.effectType != "ManaReflected")) continue;
                     std::string costStr = std::string(s.get("Cost", ""));
                     std::string lbl;
+                    if (s.effectType == "ManaReflected")
+                        lbl = std::string(s.get("SpellDescription", "Add any color"));
                     if (std::string(s.get("Produced","")) == "Any" ||
                         std::string(s.get("Produced","")) == "AnyColor")
                         lbl = "Add any color";

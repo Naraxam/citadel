@@ -110,6 +110,25 @@ const sf::Texture* TextureCache::get(const std::string& path) {
     return nullptr;
 }
 
+const sf::Texture* TextureCache::getSync(const std::string& path) {
+    auto it = s_cache.find(path);
+    if (it != s_cache.end()) { touchLRU(path); return &it->second; }
+
+    // Decode + upload right now so the caller can draw it this frame.
+    sf::Image img;
+    if (!img.loadFromFile(path)) return nullptr;
+    evictIfFull();
+    sf::Texture tex;
+    if (!tex.create(img.getSize().x, img.getSize().y)) return nullptr;
+    tex.update(img);
+    tex.setSmooth(true);
+    auto [ins, ok] = s_cache.emplace(path, std::move(tex));
+    touchLRU(path);
+    // Don't double-load in the background if an async request was already queued.
+    { std::lock_guard<std::mutex> lk(s_mutex); s_inFlight.erase(path); }
+    return &ins->second;
+}
+
 void TextureCache::clear() {
     s_cache.clear();
     s_lru.clear();
@@ -205,13 +224,18 @@ sf::IntRect SkinAssets::manaRect(const std::string& token) {
     return {0, 0, 0, 0};
 }
 
-void SkinAssets::drawManaToken(sf::RenderTarget& t, const std::string& token,
+bool SkinAssets::hasManaSprite(const std::string& token) {
+    return manaSprite() != nullptr && manaRect(token).width != 0;
+}
+
+bool SkinAssets::drawManaToken(sf::RenderTarget& t, const std::string& token,
                                 float x, float y, float sz) {
     const sf::Texture* tex = manaSprite();
-    if (!tex) return;
+    if (!tex) return false;
     sf::IntRect rect = manaRect(token);
-    if (rect.width == 0) return;
+    if (rect.width == 0) return false;   // no sprite (tap/hybrid/etc.) — caller draws text
     drawSpriteRegion(t, *tex, rect, x, y, sz, sz);
+    return true;
 }
 
 float SkinAssets::drawManaCost(sf::RenderTarget& t, const std::string& costStr,
@@ -321,7 +345,9 @@ void drawRoundedRect(sf::RenderTarget& t, float x, float y, float w, float h,
 void drawLabel(sf::RenderTarget& t, const sf::Font& font, const std::string& str,
                float x, float y, unsigned size, sf::Color col,
                bool bold = false) {
-    sf::Text txt(str, font, size);
+    // Decode as UTF-8 so accented card names (Æther Vial, Lim-Dûl's Vault…)
+    // render correctly rather than as Latin-1 mojibake.
+    sf::Text txt(sf::String::fromUtf8(str.begin(), str.end()), font, size);
     if (bold) txt.setStyle(sf::Text::Bold);
     txt.setFillColor(col);
     txt.setPosition(x, y);
@@ -492,17 +518,33 @@ void drawCard(sf::RenderTarget& target, const sf::Font& font,
                     bar.setFillColor(sf::Color(0, 0, 0, 175));
                     target.draw(bar);
 
-                    // Card name
+                    // Mana cost (right-aligned) — measure it FIRST so the name can
+                    // be trimmed to the space left of it instead of overlapping it
+                    // (the bug that showed "Treachery{3}{U}{U}" run together).
+                    std::string cost = rules->manaCost.toString();
+                    float costW = 0.f;
+                    if (!cost.empty()) {
+                        sf::Text tmp(cost, font, 8);
+                        costW = tmp.getLocalBounds().width;
+                    }
+
+                    // Card name — truncate to whatever width remains before the cost.
+                    float nameMaxW = CARD_W - 6.f - (costW > 0.f ? costW + 5.f : 0.f);
+                    auto nameWidth = [&](const std::string& s) {
+                        sf::Text tt(sf::String::fromUtf8(s.begin(), s.end()), font, 9);
+                        tt.setStyle(sf::Text::Bold);
+                        return tt.getLocalBounds().width;
+                    };
                     std::string nm = rules->name;
-                    if (nm.size() > 13) nm = nm.substr(0, 12) + ".";
+                    if (nameWidth(nm) > nameMaxW) {
+                        while (nm.size() > 1 && nameWidth(nm + ".") > nameMaxW)
+                            nm.pop_back();
+                        nm += ".";
+                    }
                     drawLabel(target, font, nm, x + 3.f, y + 2.f, 9,
                               sf::Color(235, 235, 215), true);
 
-                    // Mana cost (right-aligned in the bar)
-                    std::string cost = rules->manaCost.toString();
                     if (!cost.empty()) {
-                        sf::Text tmp(cost, font, 8);
-                        float costW = tmp.getLocalBounds().width;
                         float costX = x + CARD_W - costW - 4.f;
                         drawLabel(target, font, cost, costX, y + 3.f, 8,
                                   sf::Color(220, 196, 110));
@@ -852,7 +894,7 @@ void drawCard(sf::RenderTarget& target, const sf::Font& font,
 
 void drawCardLarge(sf::RenderTarget& target, const sf::Font& font,
                    const mtg::Card* card, float x, float y, float w, float h,
-                   const std::string& picsDir) {
+                   const std::string& picsDir, bool syncImage) {
     if (!card) return;
     const mtg::CardRules* rules = card->rules;
 
@@ -860,7 +902,11 @@ void drawCardLarge(sf::RenderTarget& target, const sf::Font& font,
     {
         auto imgPath = findCardImage(rules->name, picsDir);
         if (!imgPath.empty()) {
-            if (const auto* tex = TextureCache::get(imgPath)) {
+            // The large preview loads synchronously so its art is up THIS frame
+            // rather than flashing the text fallback during the async gap.
+            const auto* tex = syncImage ? TextureCache::getSync(imgPath)
+                                        : TextureCache::get(imgPath);
+            if (tex) {
                 sf::Sprite spr(*tex);
                 float scaleX = w / static_cast<float>(tex->getSize().x);
                 float scaleY = h / static_cast<float>(tex->getSize().y);
@@ -935,13 +981,21 @@ void drawCardLarge(sf::RenderTarget& target, const sf::Font& font,
         std::string text = rules->oracleText;
         float lineH = static_cast<float>(oracleSize) + 3.f;
         while (!text.empty() && ty + lineH < y + h - 25.f) {
+            // Break hard at an embedded newline (oracle text uses real '\n' between
+            // abilities); otherwise word-wrap. Without this the '\n'-containing
+            // substring renders two physical lines but ty only advances once,
+            // overlapping the next line.
             std::string line;
-            if (static_cast<int>(text.size()) <= charsPerLine) {
+            size_t nl = text.find('\n');
+            if (nl != std::string::npos && static_cast<int>(nl) <= charsPerLine) {
+                line = text.substr(0, nl);
+                text = text.substr(nl + 1);
+            } else if (static_cast<int>(text.size()) <= charsPerLine) {
                 line = text;
                 text.clear();
             } else {
                 size_t sp = text.rfind(' ', static_cast<size_t>(charsPerLine));
-                if (sp == std::string::npos) sp = static_cast<size_t>(charsPerLine);
+                if (sp == std::string::npos || sp == 0) sp = static_cast<size_t>(charsPerLine);
                 line = text.substr(0, sp);
                 text = text.substr(sp + 1);
             }

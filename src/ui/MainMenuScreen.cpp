@@ -156,19 +156,77 @@ void MainMenuScreen::drawNavItem(sf::RenderTarget& t, int idx,
     iconBg.setOutlineThickness(1.f);
     t.draw(iconBg);
 
-    // Icon glyph — ASCII only
-    const char* glyph = (idx == 0) ? ">"
-                       : (idx == 1) ? "#"
-                       : (idx == 2) ? "v"
-                       :              "x";
-    sf::Text ico(glyph, m_font, 18);
-    ico.setStyle(sf::Text::Bold);
-    ico.setFillColor(primary ? sf::Color(42, 20, 8) : kGoldBrt);
-    auto ib = ico.getLocalBounds();
-    ico.setPosition(iconX + (iconSz - ib.width) * 0.5f - ib.left,
-                    iconY + (iconSz - ib.height) * 0.5f - ib.top);
-    applyTextScale(ico);
-    t.draw(ico);
+    // Icon — drawn as a simple geometric glyph (the old text glyphs "#"/"v"/"x"
+    // read as stray letters). cx/cy is the icon-square centre.
+    const sf::Color icoCol = primary ? sf::Color(42, 20, 8) : kGoldBrt;
+    const float cx = iconX + iconSz * 0.5f;
+    const float cy = iconY + iconSz * 0.5f;
+    auto line = [&](float x1, float y1, float x2, float y2, float thick) {
+        sf::Vector2f a(x1, y1), b(x2, y2);
+        sf::Vector2f d = b - a;
+        float len = std::sqrt(d.x * d.x + d.y * d.y);
+        sf::RectangleShape r({len, thick});
+        r.setOrigin(0.f, thick * 0.5f);
+        r.setPosition(a);
+        r.setRotation(std::atan2(d.y, d.x) * 180.f / 3.14159265f);
+        r.setFillColor(icoCol);
+        t.draw(r);
+    };
+    switch (idx) {
+        case 0: {  // Play — right-pointing triangle
+            sf::CircleShape tri(9.f, 3);
+            tri.setFillColor(icoCol);
+            tri.setOrigin(9.f, 9.f);
+            tri.setPosition(cx + 1.f, cy);
+            tri.setRotation(90.f);
+            t.draw(tri);
+            break;
+        }
+        case 1: {  // Deck Builder — two stacked cards
+            for (int k = 0; k < 2; ++k) {
+                sf::RectangleShape card({13.f, 17.f});
+                card.setOrigin(6.5f, 8.5f);
+                card.setPosition(cx - 3.f + k * 6.f, cy + 3.f - k * 6.f);
+                card.setFillColor(sf::Color::Transparent);
+                card.setOutlineColor(icoCol);
+                card.setOutlineThickness(2.f);
+                t.draw(card);
+            }
+            break;
+        }
+        case 2: {  // Download Art — down arrow into a tray
+            line(cx, cy - 9.f, cx, cy + 4.f, 2.5f);
+            line(cx, cy + 5.f, cx - 6.f, cy - 1.f, 2.5f);
+            line(cx, cy + 5.f, cx + 6.f, cy - 1.f, 2.5f);
+            line(cx - 8.f, cy + 9.f, cx + 8.f, cy + 9.f, 2.5f);
+            break;
+        }
+        case 3: {  // AI Data — 2x2 grid of dots
+            for (int gy = 0; gy < 2; ++gy)
+                for (int gx = 0; gx < 2; ++gx) {
+                    sf::CircleShape d(2.6f);
+                    d.setFillColor(icoCol);
+                    d.setPosition(cx - 6.f + gx * 8.f, cy - 6.f + gy * 8.f);
+                    t.draw(d);
+                }
+            break;
+        }
+        case 4: {  // Settings — ring (gear stand-in)
+            sf::CircleShape ring(8.f);
+            ring.setOrigin(8.f, 8.f);
+            ring.setPosition(cx, cy);
+            ring.setFillColor(sf::Color::Transparent);
+            ring.setOutlineColor(icoCol);
+            ring.setOutlineThickness(3.f);
+            t.draw(ring);
+            break;
+        }
+        default: {  // Quit — X
+            line(cx - 7.f, cy - 7.f, cx + 7.f, cy + 7.f, 2.5f);
+            line(cx - 7.f, cy + 7.f, cx + 7.f, cy - 7.f, 2.5f);
+            break;
+        }
+    }
 
     // Label
     float textX = iconX + iconSz + 18.f;
@@ -217,13 +275,17 @@ void MainMenuScreen::draw(sf::RenderWindow& w) const {
     brand.setStyle(sf::Text::Bold);
     brand.setFillColor(kInk);
     brand.setPosition(NAV_X, 24.f);
+    // Measure the brand's real extent BEFORE applyTextScale (which rescales the
+    // glyphs) so the mana pips sit AFTER the text instead of overlapping the "G".
+    float brandRight = NAV_X + brand.getLocalBounds().left + brand.getLocalBounds().width;
     applyTextScale(brand);
     w.draw(brand);
 
-    // Mana pips
+    // Mana pips — placed just past the measured brand width.
+    float pipX = brandRight + 18.f;
     for (int i = 0; i < 5; ++i) {
         sf::CircleShape pip(5.f);
-        pip.setPosition(NAV_X + 150.f + i * 15.f, 31.f);
+        pip.setPosition(pipX + i * 15.f, 31.f);
         pip.setFillColor(pipColour(i));
         w.draw(pip);
     }

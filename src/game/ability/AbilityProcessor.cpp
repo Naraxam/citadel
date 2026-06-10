@@ -150,7 +150,12 @@ bool AbilityProcessor::activateManaAbility(ObjectId sourceId, uint8_t controller
     for (const auto* linePtr : manaLines) {
         const auto& rawLine = *linePtr;
         auto script = parseScriptLine(rawLine);
-        if (script.abilityType != "AB" || script.effectType != "Mana") continue;
+        // "ManaReflected" (Exotic Orchard) is a mana ability too — it adds mana
+        // without using the stack, so it belongs on this fast path, not the
+        // generic targeted-ability path.
+        if (script.abilityType != "AB" ||
+            (script.effectType != "Mana" && script.effectType != "ManaReflected"))
+            continue;
 
         int targetIdx = (abilityIndex >= 0) ? abilityIndex : 0;
         if (manaIdx != targetIdx) { ++manaIdx; continue; }

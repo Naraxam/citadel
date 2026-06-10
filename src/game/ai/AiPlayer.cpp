@@ -2084,7 +2084,8 @@ bool AiPlayer::tryActivateAbilities() {
 
         for (int i = 0; i < static_cast<int>(c->rules->abilityLines.size()); ++i) {
             auto s = parseScriptLine(c->rules->abilityLines[i]);
-            if (s.abilityType != "AB" || s.effectType == "Mana") continue;
+            if (s.abilityType != "AB" ||
+                s.effectType == "Mana" || s.effectType == "ManaReflected") continue;
 
             auto costStr = std::string(s.get("Cost", ""));
 

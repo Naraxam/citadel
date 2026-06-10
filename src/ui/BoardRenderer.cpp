@@ -158,7 +158,9 @@ static float drawTxt(sf::RenderTarget& t, const sf::Font& font,
                      const std::string& str, float x, float y,
                      unsigned size, sf::Color col, bool bold = false) {
     if (str.empty()) return 0.f;
-    sf::Text txt(str, font, size);
+    // Decode as UTF-8 (not Latin-1) so accented card names — "Æther Vial",
+    // "Lim-Dûl's Vault", "Jötun Grunt" — render correctly instead of as mojibake.
+    sf::Text txt(sf::String::fromUtf8(str.begin(), str.end()), font, size);
     if (bold) txt.setStyle(sf::Text::Bold);
     txt.setFillColor(col);
     txt.setPosition(x, y);
@@ -326,82 +328,70 @@ void BoardRenderer::drawInfoBar(sf::RenderTarget& t, uint8_t pid) const {
         cx += 5.f;
     }
 
-    // Zone counts on the right side
-    constexpr float kIconSz = 16.f;
+    // Zone chips on the right side — each is a clearly-labelled, clickable button.
+    // Graveyard / Exile / Library open a browser overlay when clicked; the gold
+    // border signals "clickable" (the old cryptic icons were easy to miss).
     float rx = PLAY_W - 6.f;
-    float iconY = midY - kIconSz * 0.5f;
+    constexpr float kChipH = 20.f;
+    float chipY = midY - kChipH * 0.5f;
 
     size_t exileCount = 0;
     for (const Card* c : m_game->exile().cards())
         if (c->ownerId == pid) ++exileCount;
 
-    struct ZI { const char* key; size_t n; };
+    struct ZI { const char* key; const char* label; size_t n; };
     const ZI zones[] = {
-        {"EXILE",     exileCount},
-        {"GRAVEYARD", p.graveyard().size()},
-        {"HAND",      p.hand().size()},
-        {"LIBRARY",   p.library().size()},
+        {"EXILE",     "EXILE", exileCount},
+        {"GRAVEYARD", "GY",    p.graveyard().size()},
+        {"HAND",      "HAND",  p.hand().size()},
+        {"LIBRARY",   "LIB",   p.library().size()},
     };
-    // Reset this player's icon rects each frame; the loop below overwrites
-    // GY / Exile entries when they get drawn.
     m_gyIconRect[pid]    = {};
     m_exileIconRect[pid] = {};
     m_libIconRect[pid]   = {};
 
     for (const auto& zi : zones) {
-        std::string ns = std::to_string(zi.n);
-        // Hand at max size (7) → amber warning; over 7 → red
-        bool handOver   = (std::string_view(zi.key) == "HAND" && zi.n >= 7);
-        bool handCrit   = (std::string_view(zi.key) == "HAND" && zi.n > 7);
-        bool libLow     = (std::string_view(zi.key) == "LIBRARY" && zi.n <= 10);
-        bool libCrit    = (std::string_view(zi.key) == "LIBRARY" && zi.n <= 3);
-        sf::Color numCol = handCrit  ? kAccentRed
-                         : handOver  ? sf::Color(230, 160, 40)
-                         : libCrit   ? kAccentRed
-                         : libLow    ? sf::Color(230, 160, 40)
-                                     : sf::Color(180, 190, 180);
-        sf::Text tmp(ns, *m_font, 11);
-        float cw = tmp.getLocalBounds().width;
-        // Reserve the count's slot and remember its left edge for the hit
-        // rect (so clicking either the count or the icon works).
-        float countLeft = rx - cw - 2.f;
-        rx -= cw + 2.f;
-        drawTxt(t, *m_font, ns, rx, midY - 7.f, 11, numCol);
-        rx -= 2.f;
-        float iconLeft = rx;
-        if (SkinAssets::ready()) {
-            rx -= kIconSz;
-            iconLeft = rx;
-            SkinAssets::drawZoneIcon(t, zi.key, rx, iconY, kIconSz);
-            rx -= 6.f;
-        } else {
-            // Fallback: draw a small textual marker so the count alone isn't
-            // floating with no icon when assets aren't loaded yet.
-            std::string mark = (std::string_view(zi.key) == "GRAVEYARD") ? "[GY]"
-                             : (std::string_view(zi.key) == "EXILE")     ? "[EX]"
-                             : (std::string_view(zi.key) == "HAND")      ? "[H]"
-                                                                          : "[L]";
-            sf::Text mt(mark, *m_font, 9);
-            float mw = mt.getLocalBounds().width;
-            rx -= mw + 2.f;
-            iconLeft = rx;
-            drawTxt(t, *m_font, mark, rx, midY - 5.f, 9, sf::Color(140, 150, 140));
-            rx -= 6.f;
-        }
-        // Capture the GY / Exile click region (count + icon together).
-        float hitLeft  = iconLeft;
-        float hitRight = countLeft + cw + 2.f;
-        if (std::string_view(zi.key) == "GRAVEYARD")
-            m_gyIconRect[pid]    = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
-        else if (std::string_view(zi.key) == "EXILE")
-            m_exileIconRect[pid] = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
-        else if (std::string_view(zi.key) == "LIBRARY")
-            m_libIconRect[pid]   = sf::FloatRect(hitLeft, iconY, hitRight - hitLeft, kIconSz);
+        std::string_view key(zi.key);
+        bool viewable = (key == "GRAVEYARD" || key == "EXILE" || key == "LIBRARY");
+        bool handOver = (key == "HAND"    && zi.n >= 7);
+        bool handCrit = (key == "HAND"    && zi.n >  7);
+        bool libLow   = (key == "LIBRARY" && zi.n <= 10);
+        bool libCrit  = (key == "LIBRARY" && zi.n <=  3);
+        sf::Color numCol = handCrit ? kAccentRed
+                         : handOver ? sf::Color(230, 160, 40)
+                         : libCrit  ? kAccentRed
+                         : libLow   ? sf::Color(230, 160, 40)
+                                    : sf::Color(216, 210, 196);
+
+        std::string txt = std::string(zi.label) + " " + std::to_string(zi.n);
+        sf::Text tmp(txt, *m_font, 11);
+        float chipW = tmp.getLocalBounds().width + 12.f;
+        rx -= chipW;
+
+        sf::RectangleShape chip({chipW, kChipH});
+        chip.setPosition(rx, chipY);
+        chip.setFillColor(viewable ? sf::Color(38, 34, 28) : sf::Color(24, 22, 20));
+        chip.setOutlineThickness(1.f);
+        chip.setOutlineColor(viewable ? sf::Color(176, 138, 74, 220)
+                                      : sf::Color(70, 66, 60, 120));
+        t.draw(chip);
+        drawTxt(t, *m_font, txt, rx + 6.f, midY - 7.f, 11, numCol);
+
+        sf::FloatRect r(rx, chipY, chipW, kChipH);
+        if      (key == "GRAVEYARD") m_gyIconRect[pid]    = r;
+        else if (key == "EXILE")     m_exileIconRect[pid] = r;
+        else if (key == "LIBRARY")   m_libIconRect[pid]   = r;
+        rx -= 5.f;   // gap between chips
     }
 }
 
 BoardRenderer::ZoneIconHit
 BoardRenderer::hitInfoBarZone(float px, float py) const noexcept {
+    // The zone chips are drawn through the shifted play-area view (local x=0 maps
+    // to screen x=PLAY_X), so their rects are stored in local coordinates. Convert
+    // the incoming window x to local space before hit-testing — otherwise every
+    // click misses by PLAY_X and the GY/Exile/Library browsers never open.
+    px -= PLAY_X;
     for (int pid = 0; pid < 2; ++pid) {
         if (m_gyIconRect[pid].width > 0.f &&
             m_gyIconRect[pid].contains(px, py))
@@ -1523,7 +1513,7 @@ void BoardRenderer::drawStackSection(sf::RenderTarget& t, float& ty) const {
         const auto& gy = m_game->player(pid).graveyard().cards();
         if (gy.empty()) continue;
 
-        std::string gyLabel = (pid == 0 ? "Alice" : "Bob");
+        std::string gyLabel = m_game->player(pid).name();
         gyLabel += " GY (" + std::to_string(gy.size()) + ")";
         drawTxt(t, *m_font, gyLabel, SIDE_X + 4.f, ty, 9, sf::Color(140, 140, 145));
         ty += GY_LABEL_H;
@@ -1633,30 +1623,34 @@ void BoardRenderer::drawPromptSection(sf::RenderTarget& t, const RenderHints& hi
         y0 += 12.f;
     }
 
-    // Prompt text (word-wrapped)
+    // Prompt text (word-wrapped). A smaller font + tighter line height + wider
+    // wrap lets the full instruction fit above the buttons instead of clipping
+    // mid-sentence (the old 11px/15px wrap cut "...on battlefield. [Pass]...").
     float tx = SIDE_X + 6.f;
     float ty = y0;
     float textW = SIDE_W - 12.f;
+    float textBottom = SIDE_PROMPT_Y + SIDE_PROMPT_H - 76.f - 2.f;  // just above buttons
+    constexpr unsigned kPromptFont = 10;
+    constexpr float    kPromptLine = 13.f;
 
     std::string msg = hints.instruction.empty()
                       ? "Waiting..."
                       : hints.instruction;
 
-    // Simple word-wrap at ~24 chars
-    while (!msg.empty() && ty < SIDE_PROMPT_Y + SIDE_PROMPT_H - 80.f) {
+    while (!msg.empty() && ty + kPromptLine <= textBottom) {
         std::string line;
-        int wrapAt = static_cast<int>(textW / 7.f);
+        int wrapAt = static_cast<int>(textW / 5.5f);
         if (wrapAt < 8) wrapAt = 8;
         if (static_cast<int>(msg.size()) <= wrapAt) {
             line = msg; msg.clear();
         } else {
             size_t sp = msg.rfind(' ', static_cast<size_t>(wrapAt));
-            if (sp == std::string::npos) sp = static_cast<size_t>(wrapAt);
+            if (sp == std::string::npos || sp == 0) sp = static_cast<size_t>(wrapAt);
             line = msg.substr(0, sp);
             msg  = msg.substr(sp + 1);
         }
-        drawTxt(t, *m_font, line, tx, ty, 11, sf::Color(220, 220, 190));
-        ty += 15.f;
+        drawTxt(t, *m_font, line, tx, ty, kPromptFont, sf::Color(220, 220, 190));
+        ty += kPromptLine;
     }
 
     // OK / Cancel buttons at the bottom of the prompt section
@@ -1795,12 +1789,12 @@ void BoardRenderer::drawPreviewPanel(sf::RenderTarget& t, const RenderHints& hin
         if (cmp && cmp != c) {
             // Draw both cards stacked vertically with a divider
             constexpr float halfH = WIN_H * 0.5f - 2.f;
-            drawCardLarge(t, *m_font, c,   PREV_X, 0.f,      PREV_W, halfH, m_picsDir);
+            drawCardLarge(t, *m_font, c,   PREV_X, 0.f,      PREV_W, halfH, m_picsDir, true);
             sf::RectangleShape div({PREV_W, 2.f});
             div.setPosition(PREV_X, halfH);
             div.setFillColor(sf::Color(240, 220, 180, 60));
             t.draw(div);
-            drawCardLarge(t, *m_font, cmp, PREV_X, halfH+2.f, PREV_W, halfH, m_picsDir);
+            drawCardLarge(t, *m_font, cmp, PREV_X, halfH+2.f, PREV_W, halfH, m_picsDir, true);
             // Comparison header
             drawTxt(t, *m_font, "ALT: comparing", PREV_X + 4.f, 0.f, 7, sf::Color(100,95,85));
             return;
@@ -1841,7 +1835,7 @@ void BoardRenderer::drawPreviewPanel(sf::RenderTarget& t, const RenderHints& hin
     // the top of this panel stays visible.
     float cardX = PREV_X + (PREV_W - PREV_CARD_W) * 0.5f;
     float cardY = 140.f;
-    drawCardLarge(t, *m_font, c, cardX, cardY, PREV_CARD_W, PREV_CARD_H, m_picsDir);
+    drawCardLarge(t, *m_font, c, cardX, cardY, PREV_CARD_W, PREV_CARD_H, m_picsDir, true);
 
     // Status badges below the image
     {
@@ -1955,13 +1949,19 @@ void BoardRenderer::drawPreviewPanel(sf::RenderTarget& t, const RenderHints& hin
                 drawTxt(t, *m_font, "...", tx, ty, kOTSize, kOTCol);
                 break;
             }
-            // Extract one line (word-wrap)
+            // Extract one line, breaking hard at an embedded newline (oracle text
+            // stores "\n" between abilities as a real '\n') so multi-line cards
+            // don't render two physical lines on top of one another.
             std::string line;
-            if (static_cast<int>(remaining.size()) <= wrapAt) {
+            size_t nl = remaining.find('\n');
+            if (nl != std::string::npos && static_cast<int>(nl) <= wrapAt) {
+                line = remaining.substr(0, nl);
+                remaining = remaining.substr(nl + 1);
+            } else if (static_cast<int>(remaining.size()) <= wrapAt) {
                 line = remaining; remaining.clear();
             } else {
                 size_t sp = remaining.rfind(' ', static_cast<size_t>(wrapAt));
-                if (sp == std::string::npos) sp = static_cast<size_t>(wrapAt);
+                if (sp == std::string::npos || sp == 0) sp = static_cast<size_t>(wrapAt);
                 line = remaining.substr(0, sp);
                 remaining = remaining.substr(sp + 1);
             }
@@ -1983,8 +1983,9 @@ void BoardRenderer::drawPreviewPanel(sf::RenderTarget& t, const RenderHints& hin
                 auto rb = line.find('}', lb + 1);
                 if (rb == std::string::npos) { lb = pos; break; }
                 std::string token = line.substr(lb + 1, rb - lb - 1);
-                if (SkinAssets::ready()) {
-                    SkinAssets::drawManaToken(t, token, lx, ty, kSymSz);
+                // Sprite when the atlas has the glyph; otherwise fall back to text
+                // (tap "{T}", hybrids, etc.) so the symbol is never a blank gap.
+                if (SkinAssets::ready() && SkinAssets::drawManaToken(t, token, lx, ty, kSymSz)) {
                     lx += kSymSz + 1.f;
                 } else {
                     lx += drawTxt(t, *m_font, "{" + token + "}", lx, ty, kOTSize,
@@ -2034,6 +2035,15 @@ void BoardRenderer::drawTooltip(sf::RenderTarget& t, const RenderHints& hints) c
     if (!r.oracleText.empty()) {
         std::string text = r.oracleText;
         while (!text.empty()) {
+            // Hard-break at embedded newlines (real '\n' between abilities) before
+            // word-wrapping; a line containing '\n' would otherwise render as two
+            // physical rows in one slot and overlap the line below it.
+            size_t nl = text.find('\n');
+            if (nl != std::string::npos && nl <= 40) {
+                lines.push_back(text.substr(0, nl));
+                text = text.substr(nl + 1);
+                continue;
+            }
             size_t sp = text.rfind(' ', 40);
             if (sp == std::string::npos || text.size() <= 40) { lines.push_back(text); break; }
             lines.push_back(text.substr(0, sp));
@@ -2582,7 +2592,7 @@ void BoardRenderer::drawZoneBrowserOverlay(sf::RenderTarget& t,
     t.draw(pan);
 
     // Header
-    std::string playerName = (hints.zoneBrowsePlayer == 0) ? "Alice" : "Bob";
+    std::string playerName = m_game->player(hints.zoneBrowsePlayer).name();
     std::string zoneLabel  = (bz == BrowseZone::Exile)   ? "Exile"
                            : (bz == BrowseZone::Library) ? "Library (top first)"
                                                          : "Graveyard";

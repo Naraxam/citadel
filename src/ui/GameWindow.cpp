@@ -103,17 +103,17 @@ void GameWindow::addLog(std::string msg) {
 
     // ── Trigger sound effects based on log content ────────────────────────────
     // These patterns match the log messages produced by AiPlayer and GameWindow.
-    // Toast for notable AI actions (only show when it's Bob's turn so it doesn't spam)
-    // Toast for notable AI actions during Bob's turn
+    // Toast for notable AI actions during the AI's turn. AI log lines already carry
+    // the acting player's real name (e.g. "[Shadow the Hedgehog] casts …"), so just
+    // surface the kind of action rather than matching a fixed name.
     if (m_turn == WhosTurn::AI || m_aiRunning) {
-        if (msg.find("Bob") != std::string::npos) {
-            if      (msg.find("casts ") != std::string::npos)     showToast("Bob: " + msg);
-            else if (msg.find("attacks") != std::string::npos)    showToast("Bob: " + msg);
-            else if (msg.find("activates") != std::string::npos)  showToast("Bob: " + msg);
-        }
+        if      (msg.find("casts ") != std::string::npos)     showToast(msg);
+        else if (msg.find("attacks") != std::string::npos)    showToast(msg);
+        else if (msg.find("activates") != std::string::npos)  showToast(msg);
     }
-    // Toast for Alice's important events (trigger notifications)
-    if (msg.find("Alice") != std::string::npos || msg.find("TOKEN") != std::string::npos ||
+    // Toast for the human's important events (trigger notifications)
+    if (msg.find(m_game.player(0).name()) != std::string::npos ||
+        msg.find("TOKEN") != std::string::npos ||
         msg.find("Revealed") != std::string::npos) {
         if (msg.find("trigger") != std::string::npos || msg.find("fires") != std::string::npos ||
             msg.find("Token") != std::string::npos)
@@ -526,7 +526,7 @@ void GameWindow::startGameWithDeck(const DeckLoader::Deck& p0deck,
 
     // Coin flip — determine who plays first
     m_aliceGoesFirst = (std::uniform_int_distribution<int>(0, 1)(m_game.rng()) == 0);
-    addLog(std::string(m_aliceGoesFirst ? "Alice" : "Bob") +
+    addLog(m_game.player(m_aliceGoesFirst ? 0 : 1).name() +
            " wins the coin flip and goes first.");
     if (!m_aliceGoesFirst) {
         m_game.setActivePlayer(1);
@@ -2362,7 +2362,8 @@ void GameWindow::update() {
 
         if (!m_tm.isGameOver()) {
             m_turn = WhosTurn::Human;
-            addLog("Turn " + std::to_string(m_game.turnNumber()) + ": Alice");
+            addLog("Turn " + std::to_string(m_game.turnNumber()) + ": " +
+                   m_game.player(0).name());
             m_human.setPhaseStops(m_stops);
             m_human.startHumanTurn();
         } else {
@@ -2994,7 +2995,8 @@ void GameWindow::doAlphaStrike() {
 void GameWindow::doConcede() {
     m_game.player(0).lose();
     StateBasedActions::run(m_game);
-    addLog("Alice concedes. Bob wins!");
+    addLog(m_game.player(0).name() + " concedes. " +
+           m_game.player(1).name() + " wins!");
 }
 
 // ── ESC pause menu (replaces the old bottom dock) ─────────────────────────────
@@ -4052,7 +4054,7 @@ void GameWindow::renderTurnHistory() {
     int start = std::max(0, (int)m_turnHistory.size() - 14);
     for (int i = start; i < (int)m_turnHistory.size() && ry < py0 + ph - 10.f; ++i) {
         const auto& ts = m_turnHistory[i];
-        sf::Color col = (ts.activePlayer.find("Alice") != std::string::npos)
+        sf::Color col = (ts.activePlayer.find(m_game.player(0).name()) != std::string::npos)
                       ? sf::Color(203, 163, 90) : sf::Color(217, 116, 63);
         std::string summary = "T" + std::to_string(ts.turnNum) + " " +
                               ts.activePlayer + " | " +
@@ -4139,7 +4141,7 @@ void GameWindow::renderLifeChart() {
             };
             m_window.draw(seg, 2, sf::Lines);
         }
-        std::string label = (pid == 0 ? "Alice: " : "Bob: ") +
+        std::string label = m_game.player(pid).name() + ": " +
                             std::to_string(m_lifeHistory.back()[pid]);
         sf::Text lt(label, m_font, 9);
         lt.setFillColor(cols[pid]);
@@ -4534,7 +4536,7 @@ void GameWindow::doMulliganForAi() {
     } else {
         m_mull.aiKept = true;
         if (m_mull.aiMulls > 0) aiPutToBottom(m_mull.aiMulls);
-        std::string msg = "Bob keeps";
+        std::string msg = m_game.player(1).name() + " keeps";
         if (m_mull.aiMulls > 0)
             msg += " (mulliganed " + std::to_string(m_mull.aiMulls) + "x)";
         addLog(msg + ".");
@@ -4674,10 +4676,11 @@ void GameWindow::renderMulligan() {
     drawText(instr);
 
     // AI status
-    std::string aiTxt = "Bob: keeps";
-    if (!m_mull.aiKept) aiTxt = "Bob: deciding...";
+    const std::string& aiName = m_game.player(1).name();
+    std::string aiTxt = aiName + ": keeps";
+    if (!m_mull.aiKept) aiTxt = aiName + ": deciding...";
     else if (m_mull.aiMulls > 0)
-        aiTxt = "Bob: keeps (mulliganed " + std::to_string(m_mull.aiMulls) + "x)";
+        aiTxt = aiName + ": keeps (mulliganed " + std::to_string(m_mull.aiMulls) + "x)";
     sf::Text aiSt(aiTxt, m_font, 12);
     aiSt.setFillColor(sf::Color(160, 170, 160));
     aiSt.setPosition(OX + 10.f, OY + 40.f);
@@ -4759,13 +4762,14 @@ void GameWindow::renderMulligan() {
 
 void GameWindow::startGameFromMulligan() {
     Player& alice = m_game.player(0);
-    std::string msg = "Alice keeps a " + std::to_string((int)alice.hand().size()) + "-card hand";
+    std::string msg = m_game.player(0).name() + " keeps a " +
+                      std::to_string((int)alice.hand().size()) + "-card hand";
     if (m_mull.humanMulls > 0)
         msg += " (mulliganed " + std::to_string(m_mull.humanMulls) + "x)";
     addLog(msg + ".");
 
     if (m_aliceGoesFirst) {
-        addLog("Turn 1: Alice");
+        addLog("Turn 1: " + m_game.player(0).name());
         m_human.setPhaseStops(m_stops);
         m_human.startHumanTurn();
         m_turn = WhosTurn::Human;
@@ -4927,7 +4931,8 @@ void GameWindow::completeDiscardChoice(ObjectId cardId) {
     if (!m_game.hasPendingDiscard()) {
         while (StateBasedActions::run(m_game)) {}
         m_abilities.drainPendingTriggers();
-        addLog("Alice discards " + (inGY ? inGY->name() : "a card") + ".");
+        addLog(m_game.player(0).name() + " discards " +
+               (inGY ? inGY->name() : "a card") + ".");
     }
 }
 
@@ -5021,7 +5026,7 @@ void GameWindow::completePendingSearch(ObjectId selectedId) {
     m_game.player(ps.libPlayer).library().shuffle(m_game.rng());
     m_searchChoices.clear();
     std::string name = (moved && moved->rules) ? moved->rules->name : "card";
-    addLog("Alice finds " + name + " from library.");
+    addLog(m_game.player(ps.libPlayer).name() + " finds " + name + " from library.");
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
@@ -5045,7 +5050,8 @@ void GameWindow::render() {
                         : RenderHints{};
     // While AI is running, show current phase
     if (m_aiRunning)
-        hints.instruction = "Bob: " + (m_aiPhase.empty() ? "thinking..." : m_aiPhase);
+        hints.instruction = m_game.activePlayer().name() + ": " +
+                            (m_aiPhase.empty() ? "thinking..." : m_aiPhase);
     hints.mousePos = m_mousePos;
     hints.phase    = std::string(m_tm.currentStepName());
     hints.logLines = std::vector<std::string>(m_gameLog.begin(), m_gameLog.end());
@@ -5588,10 +5594,14 @@ void GameWindow::render() {
                 if (wrapAt < 8) wrapAt = 8;
                 while (!rem.empty() && ty < zy + panH - 8.f) {
                     std::string line;
-                    if ((int)rem.size() <= wrapAt) { line = rem; rem.clear(); }
+                    size_t nl = rem.find('\n');
+                    if (nl != std::string::npos && (int)nl <= wrapAt) {
+                        line = rem.substr(0, nl);
+                        rem  = rem.substr(nl + 1);
+                    } else if ((int)rem.size() <= wrapAt) { line = rem; rem.clear(); }
                     else {
                         size_t sp = rem.rfind(' ', (size_t)wrapAt);
-                        if (sp == std::string::npos) sp = (size_t)wrapAt;
+                        if (sp == std::string::npos || sp == 0) sp = (size_t)wrapAt;
                         line = rem.substr(0, sp);
                         rem  = rem.substr(sp + 1);
                     }
@@ -6118,8 +6128,8 @@ void GameWindow::renderGameOver() {
     {
         int life0 = m_game.player(0).life();
         int life1 = m_game.player(1).life();
-        std::string summary = "Alice: " + std::to_string(life0) + " HP    "
-                            + "Bob: "   + std::to_string(life1) + " HP";
+        std::string summary = m_game.player(0).name() + ": " + std::to_string(life0) + " HP    "
+                            + m_game.player(1).name() + ": " + std::to_string(life1) + " HP";
         sf::Text sumTxt(summary, m_font, 16);
         sumTxt.setFillColor(sf::Color(190, 190, 180));
         auto lb = sumTxt.getLocalBounds();
@@ -6156,12 +6166,14 @@ void GameWindow::renderGameOver() {
 
     // Game statistics
     {
-        char buf[128];
+        char buf[192];
         std::snprintf(buf, sizeof(buf),
-            "Turn %d  |  Alice dealt %d dmg  |  Bob dealt %d dmg",
+            "Turn %d  |  %s dealt %d dmg  |  %s dealt %d dmg",
             m_stats.turnsPlayed,
-            m_stats.damageDealt[1],  // damage dealt TO Bob = Alice's damage
-            m_stats.damageDealt[0]); // damage dealt TO Alice = Bob's damage
+            m_game.player(0).name().c_str(),
+            m_stats.damageDealt[1],  // damage dealt TO p1 = p0's damage
+            m_game.player(1).name().c_str(),
+            m_stats.damageDealt[0]); // damage dealt TO p0 = p1's damage
         sf::Text statTxt(buf, m_font, 10);
         statTxt.setFillColor(sf::Color(130, 140, 130));
         auto lb3 = statTxt.getLocalBounds();
@@ -6210,8 +6222,8 @@ void GameWindow::renderGameOver() {
     {
         int turns = m_game.turnNumber();
         sf::Text statsT("Turn " + std::to_string(turns)
-                        + "  •  Alice " + std::to_string(m_game.player(0).life()) + " HP"
-                        + "  •  Bob "   + std::to_string(m_game.player(1).life()) + " HP",
+                        + "  •  " + m_game.player(0).name() + " " + std::to_string(m_game.player(0).life()) + " HP"
+                        + "  •  " + m_game.player(1).name() + " " + std::to_string(m_game.player(1).life()) + " HP",
                         m_font, 10);
         statsT.setFillColor(sf::Color(150, 165, 150));
         auto sb = statsT.getLocalBounds();
@@ -6222,12 +6234,12 @@ void GameWindow::renderGameOver() {
         std::string extra;
         for (uint8_t pid = 0; pid < 2; ++pid) {
             if (m_game.player(pid).poisonCounters() > 0)
-                extra += std::string(pid == 0 ? "Alice" : "Bob")
+                extra += m_game.player(pid).name()
                       + " " + std::to_string(m_game.player(pid).poisonCounters()) + " poison  ";
             uint8_t opp = pid ^ 1;
             int cmd = m_game.player(pid).commanderDamageFrom(opp);
             if (cmd > 0)
-                extra += std::string(pid == 0 ? "Alice" : "Bob")
+                extra += m_game.player(pid).name()
                       + " " + std::to_string(cmd) + " cmd-dmg  ";
         }
         if (!extra.empty()) {

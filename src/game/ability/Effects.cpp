@@ -938,6 +938,82 @@ void effectDealDamage(const ScriptLine& s, EffectContext& ctx) {
     }
 }
 
+// Produce one mana, choosing among `colors` (a subset of "WUBRG", optionally with
+// 'C'). Shared by "Combo/Any" mana abilities (effectMana) and reflected mana
+// (effectManaReflected — Exotic Orchard, Reflecting Pool…). The human gets the
+// on-screen colour picker; the AI picks the colour most demanded by its hand.
+static void chooseAndProduceColor(EffectContext& ctx, uint8_t controller,
+                                  const std::string& colors, int amount,
+                                  const std::string& restriction, ObjectId producer) {
+    ManaPool& pool = ctx.game.player(controller).manaPool();
+    if (colors.empty()) return;
+    if (colors.size() == 1) {
+        addProduced(std::string(1, colors[0]), amount, pool, restriction, producer);
+        return;
+    }
+    if (controller == 0 && ctx.game.isHumanInteractive()) {
+        ctx.game.setPendingManaChoice(controller, colors, amount, restriction, producer);
+        return;
+    }
+    // AI: tally colour shards needed by hand spells and pick the most-needed one.
+    int demand[5] = {0,0,0,0,0};  // W U B R G
+    const Player& p = ctx.game.player(controller);
+    for (const Card* h : p.hand().cards())
+        for (const auto& shard : h->rules->manaCost.shards()) {
+            uint32_t a = shard.atoms;
+            if (a & ManaAtom::WHITE) ++demand[0];
+            if (a & ManaAtom::BLUE)  ++demand[1];
+            if (a & ManaAtom::BLACK) ++demand[2];
+            if (a & ManaAtom::RED)   ++demand[3];
+            if (a & ManaAtom::GREEN) ++demand[4];
+        }
+    auto idxOf = [](char c) -> int {
+        switch (c) { case 'W': return 0; case 'U': return 1; case 'B': return 2;
+                     case 'R': return 3; case 'G': return 4; }
+        return -1;
+    };
+    char pick = colors[0];
+    int best = -1;
+    for (char c : colors) {
+        int i = idxOf(c);
+        if (i >= 0 && demand[i] > best) { best = demand[i]; pick = c; }
+    }
+    addProduced(std::string(1, pick), amount, pool, restriction, producer);
+}
+
+// The mana colours (and colourless availability) a permanent could produce — used
+// by reflected-mana abilities (Exotic Orchard) that mirror another land's output.
+struct ProducibleColors { uint8_t colorMask = 0; bool colorless = false; };
+static ProducibleColors producibleColorsOf(const Card& c) {
+    ProducibleColors out;
+    if (!c.rules) return out;
+    const auto& t = c.rules->type;
+    if (t.hasSubtype("Plains"))   out.colorMask |= ManaAtom::WHITE;
+    if (t.hasSubtype("Island"))   out.colorMask |= ManaAtom::BLUE;
+    if (t.hasSubtype("Swamp"))    out.colorMask |= ManaAtom::BLACK;
+    if (t.hasSubtype("Mountain")) out.colorMask |= ManaAtom::RED;
+    if (t.hasSubtype("Forest"))   out.colorMask |= ManaAtom::GREEN;
+    auto foldColor = [&](char ch) {
+        switch (ch) {
+            case 'W': out.colorMask |= ManaAtom::WHITE; break;
+            case 'U': out.colorMask |= ManaAtom::BLUE;  break;
+            case 'B': out.colorMask |= ManaAtom::BLACK; break;
+            case 'R': out.colorMask |= ManaAtom::RED;   break;
+            case 'G': out.colorMask |= ManaAtom::GREEN; break;
+            case 'C': out.colorless = true;             break;
+        }
+    };
+    for (const auto& raw : c.rules->abilityLines) {
+        auto s = parseScriptLine(raw);
+        if (s.abilityType != "AB" || s.effectType != "Mana") continue;  // skip reflectors
+        std::string prod(s.get("Produced", ""));
+        if (prod == "Any" || prod == "AnyColor") { out.colorMask |= ManaAtom::COLORS_MASK; continue; }
+        if (prod.size() > 6 && prod.substr(0, 6) == "Combo ") prod = prod.substr(6);
+        for (char ch : prod) foldColor(ch);
+    }
+    return out;
+}
+
 void effectMana(const ScriptLine& s, EffectContext& ctx) {
     int amount   = s.getIntOrX("Amount", ctx.xValue, 1);
     std::string producedStr = std::string(s.get("Produced", "C"));
@@ -998,44 +1074,7 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
                     colors += c;
         }
         if (colors.empty()) { pool.addGeneric(amount); return; }
-        // Single-colour Combo is no choice at all — fast-path: produce it.
-        if (colors.size() == 1) {
-            addProduced(std::string(1, colors[0]), amount, pool, restriction, producer);
-            return;
-        }
-
-        if (ctx.controller == 0 && ctx.game.isHumanInteractive()) {
-            ctx.game.setPendingManaChoice(0, colors, amount, restriction, producer);
-            return;
-        }
-
-        // AI: tally colour shards needed by hand spells and pick the most-needed
-        // colour that this land can produce. If no hand spell needs a colour
-        // we can offer, take the first listed colour.
-        int demand[5] = {0,0,0,0,0};  // W U B R G
-        const Player& p = ctx.game.player(ctx.controller);
-        for (const Card* h : p.hand().cards()) {
-            for (const auto& shard : h->rules->manaCost.shards()) {
-                uint32_t a = shard.atoms;
-                if (a & ManaAtom::WHITE) ++demand[0];
-                if (a & ManaAtom::BLUE)  ++demand[1];
-                if (a & ManaAtom::BLACK) ++demand[2];
-                if (a & ManaAtom::RED)   ++demand[3];
-                if (a & ManaAtom::GREEN) ++demand[4];
-            }
-        }
-        auto idxOf = [](char c) -> int {
-            switch (c) { case 'W': return 0; case 'U': return 1; case 'B': return 2;
-                         case 'R': return 3; case 'G': return 4; }
-            return -1;
-        };
-        char pick = colors[0];
-        int best = -1;
-        for (char c : colors) {
-            int i = idxOf(c);
-            if (i >= 0 && demand[i] > best) { best = demand[i]; pick = c; }
-        }
-        addProduced(std::string(1, pick), amount, pool, restriction, producer);
+        chooseAndProduceColor(ctx, ctx.controller, colors, amount, restriction, producer);
         return;
     }
 
@@ -1048,10 +1087,46 @@ void effectMana(const ScriptLine& s, EffectContext& ctx) {
 // at this point, so it's approximated as one mana of any colour to that player.
 void effectManaReflected(const ScriptLine& s, EffectContext& ctx) {
     int amount = s.getIntOrX("Amount", ctx.xValue, 1);
+    if (amount <= 0) return;
     auto defined = s.get("Defined", "TriggeredActivator");
     uint8_t pid = resolveDefinedPlayer(defined, ctx.controller, ctx.triggerPlayer);
-    if (amount > 0)
-        addProduced("Any", amount, ctx.game.player(pid).manaPool());
+    ManaPool& pool = ctx.game.player(pid).manaPool();
+    std::string restriction(s.get("RestrictValid", ""));
+    ObjectId    producer = ctx.source ? ctx.source->id : kInvalidId;
+
+    // Exotic Orchard / Reflecting Pool: "Add one mana of any color that a permanent
+    // matching Valid$ could produce" (ReflectProperty$ Produce). Gather the colours
+    // every matching permanent could make, then let the controller pick one.
+    auto valid = s.get("Valid", "");
+    if (s.get("ReflectProperty", "") == "Produce" && !valid.empty()) {
+        uint8_t  mask = 0;
+        bool     colorless = false;
+        ObjectId srcId = ctx.source ? ctx.source->id : kInvalidId;
+        for (const Card* c : ctx.game.battlefield().cards()) {
+            if (!c || c == ctx.source) continue;   // a land never reflects itself
+            if (!cardMatchesAnyFilter(*c, std::string(valid), pid, srcId, ctx.source, &ctx.game))
+                continue;
+            ProducibleColors pc = producibleColorsOf(*c);
+            mask      |= pc.colorMask;
+            colorless |= pc.colorless;
+        }
+        std::string colors;
+        if (mask & ManaAtom::WHITE) colors += 'W';
+        if (mask & ManaAtom::BLUE)  colors += 'U';
+        if (mask & ManaAtom::BLACK) colors += 'B';
+        if (mask & ManaAtom::RED)   colors += 'R';
+        if (mask & ManaAtom::GREEN) colors += 'G';
+        // ColorOrType$ Type (Reflecting Pool) also lets {C} be reflected; the
+        // default ColorOrType$ Color (Exotic Orchard) is coloured mana only.
+        if (s.get("ColorOrType", "Color") == "Type" && colorless) colors += 'C';
+        if (colors.empty()) return;   // nothing an opponent's lands could produce
+        chooseAndProduceColor(ctx, pid, colors, amount, restriction, producer);
+        return;
+    }
+
+    // Fallback (TapsForMana reflection — Barbflare Gremlin, etc.): the specific
+    // colour isn't tracked at this point, so approximate as one mana of any colour.
+    addProduced("Any", amount, pool, restriction, producer);
 }
 
 // Attempt to use Dredge instead of drawing one card. Returns true if Dredge was used.

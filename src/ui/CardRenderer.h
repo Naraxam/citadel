@@ -62,6 +62,13 @@ public:
     // On first call for a path, queues an async load; returns nullptr until done.
     static const sf::Texture* get(const std::string& path);
 
+    // Like get(), but loads + uploads the texture synchronously on the calling
+    // (render) thread when it isn't cached yet, so it's available THIS frame.
+    // Used for the large hover/preview card where a one-frame async gap would
+    // otherwise flash the text fallback. Returns nullptr only if the file can't
+    // be decoded. Must be called from the render thread.
+    static const sf::Texture* getSync(const std::string& path);
+
     // Must be called once per frame from the main thread to promote completed
     // background loads into the SFML-usable cache (SFML textures must be
     // created on the main/render thread).
@@ -114,8 +121,12 @@ public:
                                float x, float y, float sz);
 
     // Draw a single mana token by name ("W","U","B","R","G","X","0"–"20","C","S").
-    static void drawManaToken(sf::RenderTarget& t, const std::string& token,
+    // Returns false when the token has no sprite in the atlas (e.g. "{T}", hybrids),
+    // so callers can fall back to drawing the token as text.
+    static bool drawManaToken(sf::RenderTarget& t, const std::string& token,
                                float x, float y, float sz);
+    // True when drawManaToken would render a sprite for this token.
+    static bool hasManaSprite(const std::string& token);
 
     // Draw a zone icon by key ("HAND","LIBRARY","GRAVEYARD","EXILE").
     static void drawZoneIcon(sf::RenderTarget& t, const std::string& key,
@@ -187,6 +198,7 @@ void drawCardLarge(sf::RenderTarget& target,
                    const sf::Font&       font,
                    const mtg::Card*      card,
                    float x, float y, float w, float h,
-                   const std::string& picsDir = "");
+                   const std::string& picsDir = "",
+                   bool syncImage = false);
 
 } // namespace ui
